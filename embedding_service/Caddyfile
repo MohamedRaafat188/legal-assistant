@@ -1,0 +1,26 @@
+# No domain available for this trial deployment, so Caddy issues a
+# self-signed certificate from its internal CA instead of Let's Encrypt
+# (which requires a public DNS name). Clients must either trust Caddy's
+# internal root CA or skip certificate verification for this endpoint.
+#
+# RFC 6066 forbids sending SNI for literal IP addresses, so TLS clients
+# (curl, Python requests, browsers) connect to a bare IP with NO SNI at
+# all. Caddy picks which certificate to serve based on SNI, so without
+# `default_sni` it has nothing to match on and the handshake fails with a
+# generic "internal error" alert. default_sni tells Caddy which site to
+# assume when the ClientHello carries no SNI.
+#
+# If a domain becomes available later, replace the address below with the
+# domain name, remove `tls internal` and the `default_sni` block below --
+# Caddy will then obtain a real Let's Encrypt certificate automatically and
+# normal clients will send proper SNI for the domain.
+
+{
+	default_sni 157.180.119.126
+}
+
+https://157.180.119.126 {
+	tls internal
+
+	reverse_proxy embedding:8000
+}

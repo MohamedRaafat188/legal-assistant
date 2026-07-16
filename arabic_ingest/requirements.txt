@@ -1,0 +1,9 @@
+# --- Phase 1: PDF ingestion ---
+pypdf>=5.0
+# poppler is a SYSTEM dependency (provides the pdftotext binary), not pip:
+#   Windows (conda):  conda install -c conda-forge poppler
+#   Debian/Ubuntu:    apt-get install -y poppler-utils
+
+# --- Phase 2: RAG core ---
+qdrant-client>=1.12
+FlagEmbedding>=1.2.10      # BGE-M3 hybrid embeddings (pulls torch on first install)

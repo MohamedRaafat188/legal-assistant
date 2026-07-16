@@ -1,0 +1,16 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: legal-assistant-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: legal_assistant
+      POSTGRES_PASSWORD: legal_assistant_dev
+      POSTGRES_DB: legal_assistant
+    ports:
+      - "5432:5432"
+    volumes:
+      - legal_assistant_pgdata:/var/lib/postgresql/data
+
+volumes:
+  legal_assistant_pgdata:

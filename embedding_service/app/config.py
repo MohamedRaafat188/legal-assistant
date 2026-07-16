@@ -1,0 +1,30 @@
+"""Configuration for the embedding service, loaded from environment / .env."""
+
+from __future__ import annotations
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    """Embedding-service settings."""
+
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+
+    # Must match arabic_ingest/config.py's EMBEDDING_MODEL exactly.
+    embedding_model: str = "BAAI/bge-m3"
+    # arabic_ingest defaults this to True but auto-forces False on CPU-only
+    # boxes inside BGEM3FlagModel.__init__ -- set explicitly here for clarity
+    # on a GPU-less Hetzner VPS.
+    bge_use_fp16: bool = False
+    # Matches FlagEmbedding's own default (and ingestion's un-overridden default).
+    bge_max_length: int = 8192
+    # Passages per internal batch during /rerank, to cap the ColBERT memory spike.
+    rerank_batch_size: int = 6
+
+    # Bearer token required on /embed and /rerank.
+    embedding_service_token: str
+
+
+def get_settings() -> Settings:
+    """Return a freshly loaded Settings instance."""
+    return Settings()
