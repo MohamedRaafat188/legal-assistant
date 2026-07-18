@@ -7,6 +7,7 @@ The model is loaded once at startup (lifespan) and reused across requests.
 from __future__ import annotations
 
 import logging
+import threading
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, HTTPException
@@ -19,6 +20,15 @@ from .model import get_service
 # already controls the peak-memory spike; this cap bounds total request latency
 # and rejects pathological requests before they can queue up work.
 _MAX_RERANK_PASSAGES = 50
+
+# BGE-M3 inference wants every CPU core on this GPU-less box. FastAPI runs
+# sync `def` endpoints in a threadpool, so without this lock two concurrent
+# /embed or /rerank calls would run their encode() in parallel threads,
+# fighting over the same cores (and RAM -- see docker-compose.yml's swap
+# comment) and slowing both down together rather than one queuing behind
+# the other. Serializing keeps each call's latency close to its solo-run
+# cost instead of compounding under concurrent load.
+_inference_lock = threading.Lock()
 
 logging.basicConfig(level=logging.INFO)
 _log = logging.getLogger(__name__)
@@ -83,7 +93,8 @@ def health() -> HealthResponse:
 def embed(request: EmbedRequest) -> EmbedResponse:
     """Normalize + encode one or more texts into dense + sparse vectors."""
     try:
-        vectors = get_service().embed(request.texts)
+        with _inference_lock:
+            vectors = get_service().embed(request.texts)
     except RuntimeError as exc:
         _log.exception("embed failed")
         raise HTTPException(status_code=500, detail=f"embedding failed: {exc}") from exc
@@ -107,7 +118,8 @@ def rerank(request: RerankRequest) -> RerankResponse:
             detail=f"too many passages ({len(request.passages)} > {_MAX_RERANK_PASSAGES})",
         )
     try:
-        scores = get_service().rerank(request.query, request.passages)
+        with _inference_lock:
+            scores = get_service().rerank(request.query, request.passages)
     except RuntimeError as exc:
         _log.exception("rerank failed")
         raise HTTPException(status_code=500, detail=f"rerank failed: {exc}") from exc

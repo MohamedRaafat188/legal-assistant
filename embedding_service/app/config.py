@@ -16,8 +16,10 @@ class Settings(BaseSettings):
     # boxes inside BGEM3FlagModel.__init__ -- set explicitly here for clarity
     # on a GPU-less Hetzner VPS.
     bge_use_fp16: bool = False
-    # Matches FlagEmbedding's own default (and ingestion's un-overridden default).
-    bge_max_length: int = 8192
+    # Matches FlagEmbedding's own default (and ingestion's un-overridden default)
+    # was 8192; lowered to bound worst-case rerank latency on this CPU-only box --
+    # see embedding_service latency investigation.
+    bge_max_length: int = 1536
     # Passages per internal batch during /rerank, to cap the ColBERT memory spike.
     rerank_batch_size: int = 6
 
