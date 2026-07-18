@@ -3,13 +3,25 @@
 from __future__ import annotations
 
 import datetime
+import re
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+_USERNAME_RE = re.compile(r"^[a-zA-Z0-9_.-]{3,32}$")
 
 
 class RegisterRequest(BaseModel):
-    username: str = Field(min_length=1, max_length=64)
+    username: str = Field(min_length=3, max_length=32)
     password: str = Field(min_length=8, max_length=256)
+
+    @field_validator("username")
+    @classmethod
+    def _validate_username(cls, value: str) -> str:
+        if not _USERNAME_RE.match(value):
+            raise ValueError(
+                "username must be 3-32 characters: letters, digits, '_', '.', or '-' only"
+            )
+        return value
 
 
 class LoginRequest(BaseModel):
