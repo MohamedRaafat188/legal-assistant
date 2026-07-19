@@ -6,6 +6,7 @@ The model is loaded once at startup (lifespan) and reused across requests.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import threading
 from contextlib import asynccontextmanager
@@ -14,6 +15,7 @@ from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from .auth import require_bearer_token
+from .config import get_settings
 from .model import get_service
 
 # Hard cap on passages per /rerank call. The internal batching (rerank_batch_size)
@@ -21,14 +23,14 @@ from .model import get_service
 # and rejects pathological requests before they can queue up work.
 _MAX_RERANK_PASSAGES = 50
 
-# BGE-M3 inference wants every CPU core on this GPU-less box. FastAPI runs
-# sync `def` endpoints in a threadpool, so without this lock two concurrent
+# On a GPU-less CPU box, BGE-M3 inference wants every core. FastAPI runs sync
+# `def` endpoints in a threadpool, so without this lock two concurrent
 # /embed or /rerank calls would run their encode() in parallel threads,
-# fighting over the same cores (and RAM -- see docker-compose.yml's swap
-# comment) and slowing both down together rather than one queuing behind
-# the other. Serializing keeps each call's latency close to its solo-run
-# cost instead of compounding under concurrent load.
-_inference_lock = threading.Lock()
+# fighting over the same cores and RAM, slowing both down together rather
+# than one queuing behind the other. A GPU parallelizes overlapping
+# inference far better, so `serialize_inference=False` (set by the Modal
+# deployment) skips the lock.
+_inference_lock = threading.Lock() if get_settings().serialize_inference else contextlib.nullcontext()
 
 logging.basicConfig(level=logging.INFO)
 _log = logging.getLogger(__name__)

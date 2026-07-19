@@ -31,6 +31,11 @@ class Settings(BaseSettings):
     # but it showed no latency win and was measurably slower/heavier in
     # practice -- CPU rerank is compute- not batch-count-bound. Kept at 6.
     rerank_batch_size: int = 6
+    # Serialize /embed and /rerank calls through a lock so concurrent requests
+    # don't fight over the same CPU cores (see main.py). A GPU parallelizes
+    # overlapping inference far better, so the Modal deployment sets this to
+    # False; the CPU/Hetzner deployment keeps the default True.
+    serialize_inference: bool = True
 
     # Bearer token required on /embed and /rerank.
     embedding_service_token: str

@@ -4,20 +4,15 @@ plus exact-lookup and the مواد الإصدار (enacting-provision) edge case
 For each operator-provided test query: embed via /embed -> Qdrant hybrid
 search (dense + sparse prefetch, RRF fusion) for RERANK_CANDIDATES candidates
 -> /rerank -> top 5. Reports whether an expected article appears in top-5 and
-at what rank.
-
-Also captures rerank latency (wall-clock, as the caller would see it) and,
-via SSH to the Hetzner VPS, peak container memory during the run -- the
-empirical basis for the 4 GB-stay-or-8 GB-upsize decision.
+at what rank, plus rerank latency (wall-clock, as the caller would see it).
 
 Usage:
-    python scripts/check_retrieval.py [--vps-host root@157.180.119.126] [--ssh-key path]
+    python scripts/check_retrieval.py
 """
 
 from __future__ import annotations
 
 import argparse
-import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
@@ -291,82 +286,8 @@ def enacting_provision_check(cloud_client, client: EmbeddingClient, collection_n
     return found
 
 
-def measure_vps_memory(vps_host: str | None, ssh_key: str | None, duration_s: int = 60) -> str | None:
-    """Poll `docker stats` on the VPS in the background; return the log path."""
-    if not vps_host:
-        return None
-    log_path = "/tmp/embedding_memlog.txt"
-    ssh_cmd = ["ssh"]
-    if ssh_key:
-        ssh_cmd += ["-i", ssh_key]
-    ssh_cmd += [vps_host]
-    remote_script = (
-        f"rm -f {log_path}; "
-        f"for i in $(seq 1 {duration_s * 4}); do "
-        f"  date +%s.%N >> {log_path}; "
-        f"  docker stats --no-stream --format '{{{{.MemUsage}}}}' legal-assistant-embedding >> {log_path}; "
-        f"  sleep 0.25; "
-        f"done"
-    )
-    subprocess.Popen(ssh_cmd + [remote_script], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    return log_path
-
-
-def fetch_vps_memory_report(vps_host: str | None, ssh_key: str | None, log_path: str | None) -> None:
-    if not vps_host or not log_path:
-        print("\n(no VPS host provided -- skipping remote memory measurement)")
-        return
-    ssh_cmd = ["ssh"]
-    if ssh_key:
-        ssh_cmd += ["-i", ssh_key]
-    ssh_cmd += [vps_host, f"cat {log_path}"]
-    out = None
-    for attempt in range(3):
-        try:
-            out = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=30).stdout
-            break
-        except subprocess.TimeoutExpired:
-            time.sleep(5)  # the background monitor's ssh session can transiently hold the connection
-    if out is None:
-        print("\nCould not fetch VPS memory log after retries.")
-        return
-
-    lines = [l.strip() for l in out.splitlines() if l.strip()]
-    mem_values_mib: list[float] = []
-    for line in lines:
-        if "/" not in line:
-            continue
-        used = line.split("/")[0].strip()
-        try:
-            if used.endswith("GiB"):
-                mem_values_mib.append(float(used[:-3]) * 1024)
-            elif used.endswith("MiB"):
-                mem_values_mib.append(float(used[:-3]))
-        except ValueError:
-            continue
-
-    print(f"\n{'=' * 70}\n4 GB memory verdict")
-    if not mem_values_mib:
-        print("  No memory samples captured -- cannot report peak RSS.")
-        return
-
-    peak = max(mem_values_mib)
-    ceiling_mib = 3800  # container mem_limit
-    margin_pct = (ceiling_mib - peak) / ceiling_mib * 100
-    print(f"  Samples: {len(mem_values_mib)}, peak container memory: {peak:.0f} MiB")
-    print(f"  Ceiling (container mem_limit): {ceiling_mib} MiB (margin: {margin_pct:.1f}%)")
-
-    if peak >= ceiling_mib * 0.9:
-        print("  VERDICT: peak memory is near the ceiling -- recommend upsizing to 8 GB (CX32/CPX31).")
-    else:
-        print("  VERDICT: comfortable margin under the 4 GB ceiling -- staying on 4 GB (CX22) is viable.")
-    print("  NOTE: check `docker stats` swap/host `free -h` separately to confirm swap was not touched under load.")
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--vps-host", default="root@157.180.119.126", help="SSH target for memory measurement, or '' to skip")
-    parser.add_argument("--ssh-key", default=None, help="Path to SSH private key")
     args = parser.parse_args()
 
     settings = get_settings()
@@ -378,14 +299,9 @@ def main() -> None:
         print("FAIL: embedding service /health reports model not loaded.")
         raise SystemExit(1)
 
-    log_path = measure_vps_memory(args.vps_host or None, args.ssh_key, duration_s=60)
-
     timings = run_query_tests(cloud_client, client, collection_name)
     exact_ok = exact_lookup_check(cloud_client, collection_name)
     issuance_ok = enacting_provision_check(cloud_client, client, collection_name)
-
-    time.sleep(2)  # let the memory poller catch the tail of the last request
-    fetch_vps_memory_report(args.vps_host or None, args.ssh_key, log_path)
 
     print(f"\n{'=' * 70}\nSummary")
     n_hit = sum(1 for t in timings if t.found_rank)
