@@ -45,6 +45,7 @@ class BGEM3Service:
         self._model_name = settings.embedding_model
         self._use_fp16 = settings.bge_use_fp16
         self._max_length = settings.bge_max_length
+        self._rerank_max_length = settings.rerank_max_length
         self._rerank_batch_size = settings.rerank_batch_size
 
     def load(self) -> None:
@@ -107,8 +108,9 @@ class BGEM3Service:
 
         Encodes the query once, then encodes passages in small internal
         batches (``rerank_batch_size``) to cap the peak-memory spike on a
-        constrained box. The same ``max_length`` truncation as ingestion
-        applies, so a very long article can't blow up token count.
+        constrained box. Truncates to ``rerank_max_length`` (shorter than
+        embed's ``bge_max_length``), since rerank vecs are computed fresh
+        per query and don't need to match ingestion-time vectors.
         """
         if self._model is None:
             raise RuntimeError("Model not loaded. Call load() first.")
@@ -116,7 +118,7 @@ class BGEM3Service:
         normalized_query = normalize_for_embedding(query)
         query_out = self._model.encode(
             [normalized_query],
-            max_length=self._max_length,
+            max_length=self._rerank_max_length,
             return_dense=False,
             return_sparse=False,
             return_colbert_vecs=True,
@@ -130,7 +132,7 @@ class BGEM3Service:
             normalized_batch = [normalize_for_embedding(p) for p in batch]
             batch_out = self._model.encode(
                 normalized_batch,
-                max_length=self._max_length,
+                max_length=self._rerank_max_length,
                 return_dense=False,
                 return_sparse=False,
                 return_colbert_vecs=True,

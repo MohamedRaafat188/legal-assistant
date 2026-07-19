@@ -2,8 +2,9 @@
 plus exact-lookup and the مواد الإصدار (enacting-provision) edge case.
 
 For each operator-provided test query: embed via /embed -> Qdrant hybrid
-search (dense + sparse prefetch, RRF fusion) for 20 candidates -> /rerank ->
-top 5. Reports whether an expected article appears in top-5 and at what rank.
+search (dense + sparse prefetch, RRF fusion) for RERANK_CANDIDATES candidates
+-> /rerank -> top 5. Reports whether an expected article appears in top-5 and
+at what rank.
 
 Also captures rerank latency (wall-clock, as the caller would see it) and,
 via SSH to the Hetzner VPS, peak container memory during the run -- the
@@ -29,7 +30,7 @@ from legal_assistant.db.qdrant import get_cloud_client
 from legal_assistant.embedding_client import EmbeddingClient
 from qdrant_client.http import models
 
-RERANK_CANDIDATES = 20
+RERANK_CANDIDATES = 10
 TOP_K = 5
 
 

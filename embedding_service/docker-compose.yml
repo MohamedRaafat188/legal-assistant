@@ -7,6 +7,7 @@ services:
       - EMBEDDING_SERVICE_TOKEN=${EMBEDDING_SERVICE_TOKEN}
       - BGE_USE_FP16=${BGE_USE_FP16:-false}
       - BGE_MAX_LENGTH=${BGE_MAX_LENGTH:-1536}
+      - RERANK_MAX_LENGTH=${RERANK_MAX_LENGTH:-256}
       - RERANK_BATCH_SIZE=${RERANK_BATCH_SIZE:-6}
     volumes:
       - hf_cache:/srv/.cache/huggingface

@@ -20,6 +20,11 @@ class Settings(BaseSettings):
     # was 8192; lowered to bound worst-case rerank latency on this CPU-only box --
     # see embedding_service latency investigation.
     bge_max_length: int = 1536
+    # Separate, shorter cap for ColBERT rerank passages only (embed's
+    # bge_max_length must stay large enough to match ingestion-time vectors;
+    # rerank vecs are computed fresh per query, so they're free to truncate
+    # harder to cut worst-case latency).
+    rerank_max_length: int = 256
     # Passages per internal batch during /rerank, to cap the ColBERT memory spike.
     rerank_batch_size: int = 6
 
