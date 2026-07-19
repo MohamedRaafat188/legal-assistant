@@ -26,6 +26,10 @@ class Settings(BaseSettings):
     # harder to cut worst-case latency).
     rerank_max_length: int = 256
     # Passages per internal batch during /rerank, to cap the ColBERT memory spike.
+    # Tried bumping to 10 (== RERANK_CANDIDATES_DEFAULT, one batch) since
+    # measured peak memory (818 MiB) left headroom under the 3800 MiB limit,
+    # but it showed no latency win and was measurably slower/heavier in
+    # practice -- CPU rerank is compute- not batch-count-bound. Kept at 6.
     rerank_batch_size: int = 6
 
     # Bearer token required on /embed and /rerank.
