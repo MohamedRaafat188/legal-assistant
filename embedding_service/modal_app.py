@@ -10,13 +10,25 @@ corpus already stored in Qdrant Cloud depends on that code staying identical
 between deployments -- see scripts/check_embedding_consistency.py.
 
 Deploy:   modal deploy embedding_service/modal_app.py
+          then: modal run embedding_service/modal_app.py::sync_warm_state
 Dev/test: modal serve embedding_service/modal_app.py
 
 Requires a Modal secret named "embedding-service-secrets" (custom type)
 with key EMBEDDING_SERVICE_TOKEN.
+
+IMPORTANT -- always run sync_warm_state right after modal deploy: Modal
+resets a Function's autoscaler to its static decorator config (min_containers=0
+here) on every deploy, and the scheduled warm_up/cool_down crons only run at
+their fixed times (~07:55/20:00 Africa/Cairo). A deploy done mid-day would
+otherwise sit at min_containers=0 -- fully cold -- until the next scheduled
+firing, possibly hours away. sync_warm_state applies the correct warm level
+for the current moment immediately, closing that gap.
 """
 
 from __future__ import annotations
+
+from datetime import datetime, time as dt_time
+from zoneinfo import ZoneInfo
 
 import modal
 
@@ -44,15 +56,36 @@ MAX_CONCURRENT_INPUTS = 8
 SCALEDOWN_WINDOW_SECONDS = 300
 
 # Business-hours warm window (Cairo, Sun-Thu -- Egypt's work week). A
-# scheduled min_containers=1 bump just before the first lawyer arrives beats
+# scheduled min_containers bump just before the first lawyer arrives beats
 # both a cold first request and a 24/7 keep-alive poller: natural daytime
-# traffic then keeps the container warm, and it scales to zero overnight
-# for free. Adjust the day-of-week field if the actual usage pattern differs.
+# traffic then keeps containers warm, and they scale to zero overnight for
+# free. Adjust the day-of-week field if the actual usage pattern differs.
+#
+# PEAK_MIN_CONTAINERS=1: a single complex query can fire several
+# search_articles calls, and a real trace showed the *second* concurrent
+# call cold-starting a fresh container (~20-29s) while the first warm
+# container was still busy -- see the Phase 9a investigation. Bumping this
+# to 2 removes that cold start entirely, but ~doubles the daytime GPU cost
+# (~$209/mo -> ~$419/mo at Modal's L4 rate for the Sun-Thu 07:55-20:00
+# window). Operator chose to keep the cost down and accept that an
+# occasional overlapping second query may cold-start (~20-29s) -- MAX_CONTAINERS
+# still caps the worst case at 3 concurrent containers.
+PEAK_MIN_CONTAINERS = 1
+OFF_HOURS_MIN_CONTAINERS = 0
 WARM_WINDOW_TZ = "Africa/Cairo"
 WARM_UP_CRON = "55 7 * * 0-4"  # ~07:55, five minutes before the window
 COOL_DOWN_CRON = "0 20 * * 0-4"  # 20:00 -- back to scale-to-zero
+_BUSINESS_DAYS = {6, 0, 1, 2, 3}  # datetime.weekday(): Sun=6, Mon=0 ... Thu=3
+_WINDOW_START = dt_time(7, 55)
+_WINDOW_END = dt_time(20, 0)
 
-app = modal.App("legal-assistant-embedding")
+
+def _in_business_hours() -> bool:
+    now = datetime.now(ZoneInfo(WARM_WINDOW_TZ))
+    return now.weekday() in _BUSINESS_DAYS and _WINDOW_START <= now.time() < _WINDOW_END
+
+APP_NAME = "legal-assistant-embedding"
+app = modal.App(APP_NAME)
 
 
 def _download_model() -> None:
@@ -118,14 +151,38 @@ class EmbeddingService:
         return fastapi_app
 
 
+def _service_handle() -> "modal.cls.Obj":
+    """Handle to the *deployed* class's container pool. Looked up by name
+    (not a local `EmbeddingService()` reference) so this works correctly both
+    from the scheduled functions running inside the deployed app and from
+    `modal run ...::sync_warm_state`, which otherwise spins up its own
+    ephemeral app context rather than reaching the persistent deployment."""
+    return modal.Cls.from_name(APP_NAME, "EmbeddingService")()
+
+
 @app.function(schedule=modal.Cron(WARM_UP_CRON, timezone=WARM_WINDOW_TZ))
 def warm_up() -> None:
-    """Keep >=1 container warm through business hours instead of cold-starting
-    the first request of the day."""
-    EmbeddingService().web.update_autoscaler(min_containers=1)
+    """Keep PEAK_MIN_CONTAINERS warm through business hours instead of
+    cold-starting the first (or second concurrent) request of the day."""
+    _service_handle().update_autoscaler(min_containers=PEAK_MIN_CONTAINERS)
 
 
 @app.function(schedule=modal.Cron(COOL_DOWN_CRON, timezone=WARM_WINDOW_TZ))
 def cool_down() -> None:
     """End of business hours: back to scale-to-zero for the overnight idle."""
-    EmbeddingService().web.update_autoscaler(min_containers=0)
+    _service_handle().update_autoscaler(min_containers=OFF_HOURS_MIN_CONTAINERS)
+
+
+@app.function()
+def sync_warm_state() -> None:
+    """Apply the correct warm level for *right now*, regardless of the cron
+    schedule. Run this manually after every `modal deploy` -- deploys reset
+    the autoscaler to the static decorator default (min_containers=0), and
+    without this the service would otherwise stay fully cold until the next
+    scheduled warm_up/cool_down firing.
+
+        modal run embedding_service/modal_app.py::sync_warm_state
+    """
+    target = PEAK_MIN_CONTAINERS if _in_business_hours() else OFF_HOURS_MIN_CONTAINERS
+    _service_handle().update_autoscaler(min_containers=target)
+    print(f"min_containers set to {target} (business_hours={_in_business_hours()})")
