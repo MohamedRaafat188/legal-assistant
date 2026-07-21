@@ -119,6 +119,36 @@ def start_span(
         yield _NOOP_SPAN
 
 
+@contextmanager
+def session_scope(user_id: Any, session_id: Any) -> Iterator[None]:
+    """Tag the trace and all its child spans with a Langfuse user_id/session_id.
+
+    Must be entered *before* the trace's root span so the tags propagate to
+    every child observation -- Langfuse's session/user views and aggregations
+    only include observations carrying these attributes. No-ops if tracing is
+    disabled or the SDK call fails.
+    """
+    client = get_client()
+    if client is None:
+        yield
+        return
+
+    try:
+        from langfuse import propagate_attributes
+
+        cm = propagate_attributes(
+            user_id=str(user_id) if user_id is not None else None,
+            session_id=str(session_id) if session_id is not None else None,
+        )
+    except Exception:
+        _log.warning("Langfuse session/user propagation setup failed", exc_info=True)
+        yield
+        return
+
+    with cm:
+        yield
+
+
 def safe_update(span: Any, **kwargs: Any) -> None:
     """Update a span, swallowing any Langfuse-side failure."""
     try:

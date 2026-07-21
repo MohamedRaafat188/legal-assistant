@@ -182,13 +182,16 @@ class LegalAssistantAgent:
         self._retrieved_this_turn = []
         self._messages.append(HumanMessage(content=user_text))
 
-        with observability.start_span(
-            name="chat_turn",
-            trace_id=self._trace_id,
-            as_type="agent",
-            input={"user_text": user_text},
-            metadata={"conversation_id": self._conversation_id, "user_id": self._user_id},
-        ) as span:
+        with (
+            observability.session_scope(self._user_id, self._conversation_id),
+            observability.start_span(
+                name="chat_turn",
+                trace_id=self._trace_id,
+                as_type="agent",
+                input={"user_text": user_text},
+                metadata={"conversation_id": self._conversation_id, "user_id": self._user_id},
+            ) as span,
+        ):
             handler = observability.get_callback_handler()
             callbacks = [handler] if handler else None
 
