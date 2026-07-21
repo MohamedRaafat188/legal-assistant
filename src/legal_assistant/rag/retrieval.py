@@ -22,7 +22,7 @@ from legal_assistant.db.qdrant import get_cloud_client
 from legal_assistant.embedding_client import EmbeddingClient
 from legal_assistant.rag.law_identity import canonical_law_name
 
-RERANK_CANDIDATES_DEFAULT = 10
+RERANK_CANDIDATES_DEFAULT = 20
 TOP_K_DEFAULT = 5
 
 _ARABIC_INDIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
