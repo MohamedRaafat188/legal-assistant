@@ -170,12 +170,19 @@ async def load_conversation(session: AsyncSession, conversation_id: int, user_id
 
 
 async def get_working_memory(
-    session: AsyncSession, conversation_id: int, user_id: int, n: int = WORKING_MEMORY_TURNS
+    session: AsyncSession, conversation_id: int, user_id: int
 ) -> WorkingMemory:
-    """Return the last `n` turns verbatim (2n messages) plus the running summary."""
+    """Return every turn not yet folded into `summary`, verbatim, plus the summary itself.
+
+    This window isn't a fixed size: it grows from WORKING_MEMORY_TURNS up to
+    2 * WORKING_MEMORY_TURNS turns between compactions (see
+    maybe_compact_summary), then drops back down once the next batch is
+    folded in. Turns before `summarized_through_turn` are covered by
+    `summary` and are deliberately not re-sent here.
+    """
     conversation = await _get_owned_conversation(session, conversation_id, user_id)
     messages = list(conversation.messages)
-    recent = messages[-(2 * n) :] if n > 0 else []
+    recent = messages[2 * conversation.summarized_through_turn :]
     return WorkingMemory(recent_messages=recent, summary=conversation.summary)
 
 
@@ -221,7 +228,14 @@ def _render_turns(messages: list[Message]) -> str:
 
 
 async def maybe_compact_summary(session: AsyncSession, conversation_id: int, user_id: int) -> bool:
-    """Fold turns older than the working-memory window into `summary`, if the thread is long enough.
+    """Fold the next full batch of WORKING_MEMORY_TURNS turns into `summary`, once enough have piled up.
+
+    Fires once total turns reach COMPACTION_THRESHOLD_TURNS, and again every
+    WORKING_MEMORY_TURNS turns after that (e.g. at 12, 18, 24, ...). Each
+    firing folds in exactly the batch of turns between
+    `summarized_through_turn` and `summarized_through_turn + WORKING_MEMORY_TURNS`
+    -- never the whole older history -- so summarization cost stays
+    constant per call instead of growing with the conversation.
 
     Not on the response critical path -- call this after responding to the
     user, or lazily on load. Returns True if a new summary was written.
@@ -229,21 +243,27 @@ async def maybe_compact_summary(session: AsyncSession, conversation_id: int, use
     conversation = await _get_owned_conversation(session, conversation_id, user_id)
     messages = list(conversation.messages)
     total_turns = sum(1 for m in messages if m.role == "user")
+    summarized_through = conversation.summarized_through_turn
 
-    if total_turns <= COMPACTION_THRESHOLD_TURNS:
+    if total_turns < COMPACTION_THRESHOLD_TURNS:
+        return False
+    if total_turns - summarized_through < 2 * WORKING_MEMORY_TURNS:
         return False
 
-    older = messages[: -(2 * WORKING_MEMORY_TURNS)]
-    if not older:
+    batch_start_turn = summarized_through
+    batch_end_turn = summarized_through + WORKING_MEMORY_TURNS
+    batch = messages[2 * batch_start_turn : 2 * batch_end_turn]
+    if not batch:
         return False
 
     prompt = _SUMMARY_PROMPT_AR.format(
-        previous_summary=conversation.summary or "(لا يوجد)", turns_text=_render_turns(older)
+        previous_summary=conversation.summary or "(لا يوجد)", turns_text=_render_turns(batch)
     )
     llm = get_llm()
     response = await asyncio.to_thread(llm.invoke, prompt)
     new_summary = _extract_text(response.content)
 
     conversation.summary = new_summary.strip()
+    conversation.summarized_through_turn = batch_end_turn
     await session.flush()
     return True
