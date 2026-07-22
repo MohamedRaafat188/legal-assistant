@@ -1,287 +1,236 @@
 # Legal Assistant
 
-Arabic-language legal research assistant for Egyptian lawyers. Answers legal
-questions with article-level citations that must be verifiable against the
-source law text — faithfulness to the source is the top priority.
+An Arabic-language legal research assistant for Egyptian lawyers. It answers legal questions with **article-level citations that are mechanically verified** against the retrieved law text — every citation is checked in code against what was actually retrieved before it ever reaches the user, so faithfulness to the source is prioritized over fluency.
 
-This repository is being built in phases. **Phase 1** covers project
-scaffolding and a one-time migration of already-validated law vectors from a
-local Docker Qdrant instance to Qdrant Cloud, without re-embedding.
+Currently covers two ingested laws:
+
+- قانون الإجراءات الجنائية رقم ١٧٤ لسنة ٢٠٢٥ (Criminal Procedure Law 174/2025)
+- القانون المدني رقم ١٣١ لسنة ١٩٤٨ (Civil Code 131/1948)
+
+**Pipeline at a glance:**
+
+```
+PDF (Arabic law text)
+  -> structured articles (arabic_ingest/)
+  -> hybrid dense+sparse embeddings (BGE-M3) -> Qdrant Cloud
+  -> retrieval + ColBERT rerank (embedding_service/, Modal GPU)
+  -> tool-calling agent (Gemini + LangChain) -> JSON-contracted answer
+  -> citation guard (verifies every citation against retrieved text)
+  -> FastAPI, SSE streaming, Postgres persistence
+  -> Langfuse tracing / scoring
+```
+
+## Tech stack
+
+| Layer | Technology |
+|---|---|
+| Ingestion | `pdftotext` (poppler), custom Arabic text normalization |
+| Embeddings / rerank | BGE-M3 (hybrid dense+sparse) + ColBERT, via [FlagEmbedding](https://github.com/FlagOpen/FlagEmbedding) |
+| Vector DB | Qdrant Cloud (hybrid RRF search) |
+| LLM | Google Gemini via `langchain-google-genai` |
+| Agent orchestration | LangChain `create_agent` (tool-calling) |
+| API | FastAPI, Server-Sent Events (`sse-starlette`) |
+| Persistence | PostgreSQL + SQLAlchemy (async) + Alembic |
+| Observability | Langfuse Cloud |
+| GPU inference hosting | Modal (serverless, L4 GPU) |
+| App hosting | Railway (Nixpacks) |
+
+No frontend exists yet — the API is designed for one (SSE protocol, CORS defaults) but the client hasn't been built.
+
+---
+
+## Phase 1 — Ingestion: PDF to structured Arabic law articles
+
+**Location:** `arabic_ingest/` (`pdf_extractor.py`, `arabic_text.py`, `structure.py`, `articles.py`)
+
+Raw law PDFs (`data/law-131-1948.pdf`, `data/قانون الاجراءات الجنائية...pdf`) are turned into clean, structured article records — the single source of truth for everything downstream.
+
+- **Text extraction** (`pdf_extractor.py`) wraps poppler's `pdftotext`, the only engine found to preserve correct logical-order Arabic; the module refuses to run without it.
+- **Arabic normalization** (`arabic_text.py`) fixes glyph shapes, Private-Use-Area font glyphs, BiDi spacing artifacts, and clause numbering. It produces **two** normalization levels:
+  - *faithful* — verbatim text, used for citation and display (the only text a citation may ever quote).
+  - *embedding* — a version used only for vectorization.
+- **Structure detection** (`structure.py`) identifies books, parts, chapters, articles, and the "مواد الإصدار" (enacting/issuance articles).
+- **Article slicing** (`articles.py`) produces per-article records: citation label, article number, law identity, structural context (book/part/chapter), page range, and body text.
+- Inspection tools: `inspect_corpus.py` (structure report) and `preview_articles.py` (per-article JSON for manual review).
+
+**Known limitation:** clause (بند) markers that are lost or scrambled in the source PDF layout cannot be recovered; law metadata is currently hardcoded per source document rather than driven by a generic multi-law loader.
+
+---
+
+## Phase 2 — Embedding & vector indexing
+
+**Location:** `arabic_ingest/` (`embeddings.py`, `chunker.py`, `vector_store.py`, `ingest.py`)
+
+Structured articles are chunked and embedded into a searchable hybrid vector index.
+
+- **Model:** BGE-M3 (`BGEM3Embedder` in `embeddings.py`), producing **hybrid dense + sparse** vectors from a single model call.
+- **Chunking** (`chunker.py`) turns each article into a vector-DB-ready chunk: a metadata header, the faithful and normalized text, the citation label, and filterable metadata — written to `chunks_law174.json` / `chunks_law131.json`.
+- **Vector store** (`vector_store.py`, `LawVectorStore`) sets up a Qdrant collection with named dense + sparse vectors, does idempotent upserts, and runs hybrid RRF (Reciprocal Rank Fusion) search with metadata filters.
+- **`ingest.py`** is the CLI that ties it together: chunks JSON → embed → upsert into Qdrant. Supports a local embedded Qdrant (`./qdrant_storage`, no Docker) for development.
+- Each stored point's payload includes `body_faithful` (the only text ever eligible for citation), `citation_label`, `header`, and filterable metadata (`law_number`, `article_number`, book/part/chapter, status).
+
+Validated vectors were later migrated **one time**, without re-embedding, from the local Docker Qdrant instance to Qdrant Cloud (`scripts/migrate_to_cloud.py`, verified by `scripts/verify_migration.py`) — this is what production reads from today.
+
+---
+
+## Phase 3 — Embedding & rerank service
+
+**Location:** `embedding_service/` (self-contained FastAPI microservice, no dependency on the main package)
+
+A dedicated service exposes BGE-M3 embedding and ColBERT reranking over HTTP, so the main app never loads model weights itself.
+
+- **`app/model.py`** (`BGEM3Service`) loads `BAAI/bge-m3` once and exposes:
+  - `.embed()` — dense + sparse vectors, with Arabic normalization applied first.
+  - `.rerank()` — ColBERT late-interaction scoring (`colbert_vecs` / `colbert_score`), computed only at query time and never stored.
+- **`app/main.py`** exposes `GET /health` (unauthenticated) plus `POST /embed` and `POST /rerank` (both require a bearer token, `app/auth.py`). Rerank is capped at 50 passages per request and processed in internal batches to bound peak memory.
+- On the CPU deployment, inference was serialized behind a lock (`serialize_inference=True`); the GPU deployment disables this since the GPU can run overlapping requests concurrently.
+
+This service was first tuned and validated on a CPU VPS before being migrated to GPU serverless hosting (see **Phase 8 — Deployment**).
+
+---
+
+## Phase 4 — Retrieval
+
+**Location:** `src/legal_assistant/rag/retrieval.py` (`Retriever`)
+
+Two distinct retrieval paths, chosen by the agent based on the kind of question being asked:
+
+- **`search_articles(query_text, top_k=5, candidate_k=20, law_number=None)`** — conceptual/semantic search. The query is embedded, then Qdrant is queried with both dense and sparse `Prefetch` clauses fused via `FusionQuery(fusion=Fusion.RRF)`. The fused candidates are then reranked through the embedding service's ColBERT `/rerank` endpoint, and the top `k` are returned. Retrieval emits a Langfuse span recording `rerank_latency_ms` — the known slow step in the pipeline.
+- **`get_article_by_number(article_number, law_number=None)`** — exact, metadata-filtered lookup with no embedding or ranking involved, since a bare article number carries little semantic signal and hybrid search tends to misrank it. Handles Arabic-Indic digits and preserves the مكرر ("bis") distinction; if `law_number` is omitted and the number exists in both laws, all matches are returned rather than guessed.
+
+`RetrievedArticle.clean_text` is always `body_faithful` — embeddings and reranking only decide *which* article surfaces; they never touch the text that ends up quoted in a citation.
+
+---
+
+## Phase 5 — LLM agent & citation guard
+
+**Location:** `src/legal_assistant/rag/` (`agent.py`, `prompts.py`, `tools.py`, `citation_guard.py`), `src/legal_assistant/llm.py`
+
+- **LLM:** Google Gemini via `ChatGoogleGenerativeAI`, `temperature=0` — deterministic, since legal claims and citations must be reproducible, not creative.
+- **Orchestration:** `LegalAssistantAgent` wraps a LangChain `create_agent` tool-calling graph bound to two tools (`get_article_by_number`, `search_articles`) and a Pydantic response format (`{answer_text, citations}`) that the model must fill structurally.
+- **Prompting** (`prompts.py`): a strict, formal-Arabic system prompt with explicit rules — never cite from memory, how to choose between the two retrieval tools, how to disclose repealed articles, how to handle cross-law ambiguity — paired with a JSON output contract for citations.
+- **Citation guard** (`citation_guard.py`) is plain Python, not AI: it parses the model's structured citations and checks each one against the set of articles actually retrieved this session (handling Arabic-Indic digits and the مكرر distinction), plus a regex scan for unverified inline "المادة ن" mentions in the prose. On a hard failure it regenerates once with a corrective instruction; if still invalid, it returns a fixed Arabic fallback message with zero citations rather than risk a hallucinated one.
+- **Conversation memory** (`memory.py`): the last 6 turns are kept verbatim; beyond 12 turns, older turns are folded into an LLM-generated running summary. The summary carries no citation guarantees — citation correctness is guaranteed purely by replaying the persisted `retrieved_context`, so citations remain valid across sessions even after summarization.
+
+---
+
+## Phase 6 — API
+
+**Location:** `src/legal_assistant/api/`
+
+A FastAPI application (`app.py`, `create_app()`) exposes:
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /auth/register`, `POST /auth/login` | bcrypt password auth, returns `{access_token, user}`; register is IP-rate-limited |
+| `POST /conversations`, `GET /conversations`, `GET /conversations/{id}` | user-scoped conversation CRUD |
+| `POST /chat` | streamed chat over Server-Sent Events |
+| `POST /feedback` | thumbs-up/down tied to a specific traced turn |
+| `GET /health` | liveness check (also the deployment healthcheck path) |
+
+**`/chat` streaming model:** the agent runs a full turn to completion — including citation guard verification — *before* anything is streamed. The verified `answer_text` is then streamed to the client in small chunks for a responsive typing effect. This is intentional: citations are never sent until they've been verified, so a client can never render an unverified citation, and a mid-stream disconnect loses nothing since the turn was already persisted.
+
+| SSE event | Meaning |
+|---|---|
+| `token` | a chunk of the already-verified prose |
+| `citations` | sent once, after all `token` events — the only citations the client may render |
+| `withdrawn` | the guard hard-failed even after regeneration; no valid answer this turn |
+| `done` | the turn is persisted; carries the Langfuse `trace_id` for `/feedback` |
+| `error` | a downstream failure (Qdrant, embedding service, Gemini, DB) |
+
+---
+
+## Phase 7 — Observability
+
+**Location:** `src/legal_assistant/observability.py`
+
+Langfuse tracing wraps the system as a best-effort, non-blocking layer — every call swallows its own exceptions, and a no-op stand-in is used when tracing is disabled, so a Langfuse outage never affects chat behavior.
+
+- **Trace** = one `/chat` request. Session and user IDs are propagated so Langfuse's Session ID / User ID columns populate correctly.
+- **Spans:** `chat_turn` (the agent's tool choice and generation), `search_articles` / `get_article_by_number` (retrieval, including `rerank_latency_ms`), and `citation_guard`.
+- **Scores:** the citation guard's verdict is logged automatically on every trace — `hallucinated_citations_count`, `citations_verified_count`, `inline_unverified_count`, `used_fallback` — functioning as an automated hallucination monitor with no human review required. `POST /feedback` adds a lawyer's `user_feedback` (1/0) to the same trace.
+
+---
+
+## Phase 8 — Deployment & infrastructure
+
+### Embedding/rerank service — Modal (serverless GPU)
+
+**Location:** `embedding_service/modal_app.py`
+
+- Runs on an **L4 GPU** (deliberately not a larger card — BGE-M3 is a small ~2GB model, not LLM-scale).
+- `max_containers=3` as a hard spend cap, up to 8 concurrent requests per container, a 300s scale-down window, and `min_containers=0` — no warm containers are kept, trading occasional 20-30s cold starts for lower idle cost.
+- Model weights are baked into the container image at build time and loaded with `HF_HUB_OFFLINE=1`, so a cold start doesn't re-download ~2GB from the Hugging Face Hub.
+- Reuses the exact same application code as an earlier CPU/VPS deployment; only inference serialization differs between the two (the CPU deployment serializes requests behind a lock, the GPU deployment does not need to).
+- This service was migrated from a CPU VPS to Modal after tuning batch sizes, rerank candidate counts, and truncation lengths under real load — retrieval's rerank candidate pool was lowered to 10 for CPU latency, then raised back to 20 after the GPU migration changed the cost/latency tradeoff.
+
+### Main application — Railway
+
+**Location:** `railway.json`
+
+- **Build:** Nixpacks, auto-detected from `pyproject.toml`.
+- **Start command:** `alembic upgrade head && uvicorn legal_assistant.api.app:app --app-dir src --host 0.0.0.0 --port $PORT` — migrations run on every deploy, and the deploy fails loudly if a migration fails, so the app never silently starts against a stale schema.
+- **Database:** Railway's managed PostgreSQL plugin in production; `docker-compose.yml` runs a local `postgres:16-alpine` container for development.
+- `Settings.database_url` normalizes `postgres://`/`postgresql://` connection strings to `postgresql+asyncpg://` automatically for compatibility with Railway's managed connection string.
+- All dependencies are pinned to exact versions in `pyproject.toml` for reproducible builds.
+- Secrets live only in `.env` (git-ignored) locally and in Railway's environment variables in production; every secret is rotated before being placed into the production environment, rather than reusing development-time values.
+
+### Environment configuration
+
+Key variables (see `.env.example`): `QDRANT_CLOUD_URL` / `QDRANT_CLOUD_API_KEY` / `QDRANT_COLLECTION_NAME`, `EMBEDDING_SERVICE_URL` / `EMBEDDING_SERVICE_TOKEN`, `GOOGLE_API_KEY` / `LLM_MODEL`, `DATABASE_URL`, `SECRET_KEY` / `ACCESS_TOKEN_EXPIRE_MINUTES`, `CORS_ALLOW_ORIGINS`, `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` / `LANGFUSE_BASE_URL`.
+
+---
+
+## Phase 9 — Validation & testing
+
+No pytest suite exists yet (`tests/` is an empty package) — validation instead runs as standalone scripts that exercise the real stack end to end:
+
+- `scripts/phase4_validate.py`, `phase5_validate.py`, `phase6_validate.py` — in-process validation (via `httpx.ASGITransport`) against the real database, Qdrant, embedding service, and Gemini: auth, conversation ownership, streaming citation ordering, cross-session citation reuse, user isolation, guard-fallback safety, and simulated downstream outages.
+- `scripts/railway_smoke_test.py <url>` — post-deploy smoke test against the **live** Railway URL: auth, a cited chat turn over SSE, cross-session memory, isolation, feedback, and polling Langfuse Cloud to confirm trace ingestion.
+- `scripts/check_retrieval.py` — proves the retrieval path (hybrid search → rerank → exact lookup) against Qdrant Cloud with real sample queries.
+- `scripts/check_embedding_consistency.py` — proves the deployed embedding service produces vectors numerically consistent with what's already stored in Qdrant Cloud.
+
+---
 
 ## Project layout
 
 ```
-src/legal_assistant/
-    config.py      # pydantic-settings Settings
-    db/qdrant.py   # source + cloud Qdrant client factories
-scripts/
-    migrate_to_cloud.py   # one-time vector migration (source -> cloud)
-    verify_migration.py   # post-migration validation report
-tests/
+arabic_ingest/            Offline ingestion pipeline: PDF -> articles -> chunks -> Qdrant
+  pdf_extractor.py         PDF text extraction (pdftotext)
+  arabic_text.py            Arabic normalization (faithful + embedding variants)
+  structure.py               Book/part/chapter/article structure detection
+  articles.py                 Article record slicing
+  embeddings.py                BGE-M3 embedding
+  chunker.py                    Article -> chunk transformation
+  vector_store.py                 Qdrant collection management + hybrid search
+  ingest.py                        CLI: chunks -> embed -> Qdrant upsert
+
+embedding_service/         Standalone FastAPI microservice: BGE-M3 embed + ColBERT rerank
+  app/model.py               Model loading, embed(), rerank()
+  app/main.py                  FastAPI endpoints + auth
+  modal_app.py                  Modal serverless GPU deployment
+
+src/legal_assistant/       Main application package
+  rag/                        Agent, prompts, tools, citation guard, retrieval
+  api/                          FastAPI app + routes (auth, conversations, chat, feedback)
+  db/                            Postgres session + Qdrant client factories
+  llm.py                          Gemini client
+  auth.py                          Password hashing, JWT
+  observability.py                  Langfuse tracing wrapper
+  embedding_client.py                HTTP client for embedding_service
+
+scripts/                   Migration, validation, and smoke-test CLIs
+alembic/                   Postgres schema migrations
+data/                      Source law PDFs
+docker-compose.yml         Local Postgres for development
+railway.json                Railway deployment config
 ```
 
-## Setup
+Subfolder details: [`arabic_ingest/README.md`](arabic_ingest/README.md), [`embedding_service/README.md`](embedding_service/README.md).
 
-1. Create/activate the conda environment (`agents_env`) with Python 3.11+.
-2. Install the project in editable mode:
+## Setup (local development)
 
-   ```
-   pip install -e .
-   ```
-
-3. Copy `.env.example` to `.env` and fill in the real values:
-
-   ```
-   QDRANT_SOURCE_URL=http://localhost:6333
-   QDRANT_SOURCE_API_KEY=
-   QDRANT_CLOUD_URL=https://<your-cluster>.cloud.qdrant.io
-   QDRANT_CLOUD_API_KEY=<your-cloud-api-key>
-   QDRANT_COLLECTION_NAME=egyptian_law
-   QDRANT_TIMEOUT=60
-   ```
-
-   `.env` is git-ignored; only `.env.example` is committed.
-
-## Running the migration
-
-The source Qdrant (local Docker, server mode) must be running and reachable
-at `QDRANT_SOURCE_URL`. The source is only ever read from — never written to
-or deleted.
-
-```
-python scripts/migrate_to_cloud.py
-```
-
-- Mirrors the source collection's exact schema (named dense + sparse
-  vectors, HNSW config, `on_disk_payload`, quantization) when creating the
-  Cloud collection.
-- If the Cloud collection already exists with a matching config, creation is
-  skipped. Pass `--recreate` to delete and recreate it (destructive; use
-  with care).
-- Copies every point (vectors + payload verbatim) in batches of
-  128-256 with progress logging. Safe to re-run.
-
-## Validating the migration
-
-```
-python scripts/verify_migration.py
-```
-
-Prints a PASS/FAIL report checking point counts, sampled payloads, and
-sampled vector equality between source and Cloud. Exits non-zero on any
-failure — do not treat the migration as complete until this passes.
-
-## Phase 5: FastAPI application
-
-Auth, conversations, and streaming chat over the Phase 1-4 core (retrieval,
-tool-calling agent, citation guard, Postgres persistence). Langfuse
-observability and the frontend are not built yet.
-
-### Running the API
-
-Local Postgres (`docker compose up -d postgres`), Qdrant Cloud, the
-embedding service, and Gemini must all be reachable per your `.env`.
-
-```
-uvicorn legal_assistant.api.app:app --app-dir src --reload
-```
-
-Interactive docs at `http://127.0.0.1:8000/docs`; liveness check at
-`GET /health`.
-
-### Endpoints
-
-- `POST /auth/register`, `POST /auth/login` — bcrypt-hashed password auth;
-  both return `{access_token, user}`. Send the token as
-  `Authorization: Bearer <token>` on every other request. Minimal auth: no
-  refresh, reset, or verification.
-- `POST /conversations`, `GET /conversations`, `GET /conversations/{id}` —
-  scoped to the current user; a foreign or nonexistent `id` 404s.
-- `POST /chat` — `{conversation_id, message}`, streamed back over
-  Server-Sent Events.
-- `POST /feedback` — `{trace_id, rating, comment?}`, scoped to the current
-  user; see Phase 6 below.
-
-### `/chat` SSE event protocol (Option 3: prose streams, citations don't)
-
-The citation guard needs the *complete* generated answer to verify it, so
-citations are never sent until verification has already happened. Each SSE
-event is one `event: <name>` line followed by one JSON `data:` line:
-
-| event        | payload                                     | meaning |
-|--------------|----------------------------------------------|---------|
-| `token`      | `{"text": "<prose chunk>"}`                  | repeated; streamed prose from the already-guard-verified answer |
-| `citations`  | `{"citations": [{"law_name", "article_number", "citation_label"}, ...]}` | sent once, after all `token` events — the only citations the client may ever render |
-| `withdrawn`  | `{"message": "<Arabic fallback>"}`           | the guard hard-failed even after one regeneration; no prose was streamed this turn |
-| `done`       | `{"conversation_id": <id>, "trace_id": <str\|null>}` | the turn is persisted; safe to finalize the UI. `trace_id` (Langfuse) references this turn for `POST /feedback`; `null` if tracing is disabled |
-| `error`      | `{"message": "<Arabic user-safe error>"}`     | a downstream failure (Qdrant, embedding service, Gemini, DB); nothing is persisted |
-
-**Client contract:** never render a citation before its `citations` event
-arrives; on `withdrawn`, there is no valid answer for that turn.
-
-Implementation note: this streams via **chunked delivery of an
-already-verified answer**, not live token-by-token generation — the agent's
-structured `{answer_text, citations}` output and the citation guard both
-need the finished answer, so there's no partial-answer state worth showing
-early. A turn runs to completion (unchanged `LegalAssistantAgent.ask`,
-already guard-verified and already persisted) and *then* its `answer_text`
-is streamed in small chunks for a responsive typing effect. This means no
-unverified prose is ever sent, and a client disconnect mid-stream loses
-nothing, since the turn was already fully persisted before the first chunk
-went out.
-
-### Validating
-
-```
-python scripts/phase5_validate.py
-```
-
-Runs in-process (via `httpx.ASGITransport`, one event loop) against the real
-DB/Qdrant/embedding/Gemini stack, and exercises: register/login, 401 on
-missing/invalid tokens, conversation CRUD ownership, live streaming chat
-with the citations-after-guard ordering, cross-session citation reuse
-through the API, user isolation on both `GET /conversations/{id}` and
-`POST /chat`, the Option-3 safety contract (a simulated guard-fallback
-never leaks a `citations` event), and a simulated downstream outage
-producing a graceful Arabic `error` event instead of a crash. Exits
-non-zero on any failure.
-
-## Phase 6: Langfuse observability & feedback
-
-Adds Langfuse Cloud tracing over the Phase 1-5 core: every `/chat` request
-becomes one trace with spans for the agent turn, retrieval (embedding +
-Qdrant + rerank), and the citation guard; the guard's verdict is logged as
-scores on every trace (an automated hallucination monitor, no human
-required); and `POST /feedback` lets a lawyer attach a thumbs-up/down to the
-exact turn they rated. Reuses Phases 1-5 unchanged in behavior -- tracing is
-a wrapper: best-effort and non-blocking, so a Langfuse outage or
-misconfiguration never affects chat or feedback.
-
-### Config
-
-Set `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, and (optionally)
-`LANGFUSE_BASE_URL` (default `https://cloud.langfuse.com`) in `.env`. Leave
-the keys blank to run with tracing disabled -- the app behaves identically
-either way, just without traces/scores.
-
-### Mental model
-
-- **Trace** = one `/chat` request, end to end.
-- **Spans** inside it = the meaningful steps: `chat_turn` (the agent's
-  tool-choice + generation, via a LangChain/LangGraph callback handler),
-  `search_articles` / `get_article_by_number` (retrieval, with
-  `rerank_latency_ms` in metadata -- the known slow step, made visible on
-  every trace), and `citation_guard`.
-- **Scores** attached to a trace = judgments: the guard's own verdict
-  (`hallucinated_citations_count`, `citations_verified_count`,
-  `inline_unverified_count`, `used_fallback` -- logged automatically on
-  every turn) and a lawyer's `user_feedback` (via `POST /feedback`).
-
-### `POST /feedback`
-
-Authenticated, user-scoped: `{trace_id, rating, comment?}` where `rating` is
-1 (thumbs-up) or 0 (thumbs-down). Validates that `trace_id` belongs to a
-turn in a conversation owned by the caller (a `trace_id` column on the
-assistant `Message` row makes this a plain ownership-joined lookup, the same
-isolation pattern as everywhere else in the API) before writing a
-`user_feedback` score to Langfuse. A bad or foreign `trace_id` -> 404; a
-Langfuse-side failure while scoring never turns into a 5xx.
-
-The `/chat` `done` SSE event now carries `trace_id` (`null` if tracing is
-disabled) so the client can reference the turn from `/feedback`.
-
-### Validating
-
-```
-python scripts/phase6_validate.py
-```
-
-Runs against the real DB/Qdrant/embedding/Gemini/Langfuse Cloud stack (same
-`httpx.ASGITransport`, single-event-loop approach as Phase 5 -- Langfuse's
-batched async export doesn't tolerate a fresh-event-loop-per-call client any
-better than asyncpg's pool does). Exercises: a normal chat turn produces a
-trace with the expected spans/metadata and a clean guard-verdict score set;
-a forced-fallback verdict scores `used_fallback == 1`; `POST /feedback`
-attaches `user_feedback` to the right trace and is rejected for an unknown
-or foreign `trace_id`; and, with the Langfuse client forced into a broken
-state, both `/chat` and `/feedback` still complete correctly end-to-end.
-Exits non-zero on any failure.
-
-## Phase 7: Deployment to Railway
-
-Packaging and wiring only -- no changes to the verified Phase 1-6 behavior.
-Postgres runs as Railway's managed plugin; the app auto-deploys from this
-repo's `main` branch; the URL is Railway's default `*.up.railway.app`
-(no custom domain yet).
-
-### What changed for deployment
-
-- The Windows SSL cert-store workaround in `legal_assistant/__init__.py` is
-  now gated on `sys.platform == "win32"` -- a no-op on Railway's Linux
-  containers.
-- `Settings.database_url` (`config.py`) normalizes a `postgres://` or
-  `postgresql://` scheme to `postgresql+asyncpg://` automatically, so
-  Railway's managed-Postgres connection string works unmodified.
-- `railway.json` defines the build (Nixpacks, auto-detects `pyproject.toml`)
-  and the start command: `alembic upgrade head && uvicorn ... --host 0.0.0.0
-  --port $PORT`. Migrations run as part of every deploy and their failure
-  fails the deploy -- the app never silently starts against a stale schema.
-  `/health` is the Railway healthcheck path.
-- All dependencies in `pyproject.toml` are pinned to exact versions (the
-  versions validated throughout Phases 1-6) for reproducible builds.
-
-### Railway dashboard setup (operator steps -- not automatable from here)
-
-1. **New Railway project** -> **Deploy from GitHub repo** -> select this
-   repo. Enable auto-deploy on push to `main`.
-2. **Add the Postgres plugin** to the project. Railway provisions it and
-   exposes a reference variable (e.g. `${{Postgres.DATABASE_URL}}`) you can
-   wire directly into the app service's `DATABASE_URL` -- no manual
-   connection-string copying, and it stays in sync if Railway ever rotates
-   it.
-3. **Set every other environment variable** on the app service (Settings ->
-   Variables), matching `.env.example`'s names exactly:
-   `QDRANT_CLOUD_URL`, `QDRANT_CLOUD_API_KEY`, `QDRANT_COLLECTION_NAME`,
-   `QDRANT_TIMEOUT`, `EMBEDDING_SERVICE_URL`, `EMBEDDING_SERVICE_TOKEN`,
-   `GOOGLE_API_KEY`, `LLM_MODEL`, `SECRET_KEY`, `ACCESS_TOKEN_EXPIRE_MINUTES`,
-   `CORS_ALLOW_ORIGINS`, `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`,
-   `LANGFUSE_BASE_URL`. **Every value must be freshly rotated** -- anything
-   that ever existed in a local `.env` during development is considered
-   burned, per the secret-hygiene gate below. `QDRANT_SOURCE_URL` /
-   `QDRANT_SOURCE_API_KEY` are Phase-1-only (one-time local migration) and
-   are not needed in Railway.
-4. Set `CORS_ALLOW_ORIGINS` to the actual Railway app URL once it's known
-   (e.g. `["https://your-app.up.railway.app"]`) -- never a wildcard.
-5. Confirm the healthcheck path is `/health` (already set in `railway.json`;
-   Railway reads this file automatically).
-6. Push to `main` to trigger the first deploy, then run the post-deploy
-   smoke test below against the live URL.
-
-### Secret hygiene
-
-This repo was initialized from a clean working tree with `.env` already
-git-ignored -- **no real secret was ever committed, so there is no git
-history to scrub.** Only `.env.example` (placeholder values) is tracked.
-Every secret that was ever used locally during development (Gemini key,
-Qdrant Cloud key, Hetzner `EMBEDDING_SERVICE_TOKEN`, JWT `SECRET_KEY`,
-Langfuse keys) must still be rotated before going live, since "never
-committed" is not the same as "never seen outside Railway" -- Railway's env
-vars should hold fresh values, not reused dev-time ones.
-
-### Post-deploy smoke test
-
-```
-python scripts/railway_smoke_test.py https://<your-app>.up.railway.app
-```
-
-Hits the **live deployed URL** (not in-process) to prove Railway can
-actually reach every external dependency: register/login (JWT), conversation
-CRUD, a grounded/cited `/chat` turn over SSE (exercising Qdrant Cloud, the
-Hetzner embedding+rerank endpoint, and Gemini from Railway's network), a
-second turn proving cross-session memory, user isolation on both
-`GET /conversations/{id}` and `POST /chat`, `/feedback`, and -- using local
-Langfuse credentials to poll Langfuse Cloud directly -- that the trace
-ingested with its guard-verdict and feedback scores. Exits non-zero on any
-failure. (Simulated downstream-outage resilience is already proven
-in-process by `phase5_validate.py` / `phase6_validate.py` and is not
-re-tested against production.)
+1. Python 3.11+, install the project in editable mode: `pip install -e .`
+2. Copy `.env.example` to `.env` and fill in Qdrant Cloud, embedding service, Gemini, database, and (optionally) Langfuse credentials.
+3. Start local Postgres: `docker compose up -d postgres`, then `alembic upgrade head`.
+4. Run the API: `uvicorn legal_assistant.api.app:app --app-dir src --reload` — interactive docs at `http://127.0.0.1:8000/docs`.
