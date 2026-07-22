@@ -7,6 +7,8 @@ Currently covers two ingested laws:
 - قانون الإجراءات الجنائية رقم ١٧٤ لسنة ٢٠٢٥ (Criminal Procedure Law 174/2025)
 - القانون المدني رقم ١٣١ لسنة ١٩٤٨ (Civil Code 131/1948)
 
+**Live demo:** a basic web UI is deployed and open to try at [legal-assistant-frontend.mohamedraafat800.workers.dev](https://legal-assistant-frontend.mohamedraafat800.workers.dev/).
+
 **Pipeline at a glance:**
 
 ```
@@ -34,6 +36,7 @@ PDF (Arabic law text)
 | Observability | Langfuse Cloud |
 | GPU inference hosting | Modal (serverless, L4 GPU) |
 | App hosting | Railway (Nixpacks) |
+| Frontend hosting | Cloudflare Workers |
 
 ---
 
