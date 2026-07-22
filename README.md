@@ -35,8 +35,6 @@ PDF (Arabic law text)
 | GPU inference hosting | Modal (serverless, L4 GPU) |
 | App hosting | Railway (Nixpacks) |
 
-No frontend exists yet — the API is designed for one (SSE protocol, CORS defaults) but the client hasn't been built.
-
 ---
 
 ## Phase 1 — Ingestion: PDF to structured Arabic law articles
