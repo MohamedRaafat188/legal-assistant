@@ -19,6 +19,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from legal_assistant.config import get_settings
 from legal_assistant.db.models import Conversation, Message
 from legal_assistant.llm import get_llm
 from legal_assistant.rag.citation_guard import AllowedSet, normalize_law_name
@@ -259,7 +260,7 @@ async def maybe_compact_summary(session: AsyncSession, conversation_id: int, use
     prompt = _SUMMARY_PROMPT_AR.format(
         previous_summary=conversation.summary or "(لا يوجد)", turns_text=_render_turns(batch)
     )
-    llm = get_llm()
+    llm = get_llm(model=get_settings().summary_llm_model)
     response = await asyncio.to_thread(llm.invoke, prompt)
     new_summary = _extract_text(response.content)
 

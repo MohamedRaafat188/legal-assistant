@@ -32,6 +32,10 @@ class Settings(BaseSettings):
     # LLM (Gemini, via langchain-google-genai)
     google_api_key: str
     llm_model: str
+    # Cheaper model for conversation-summary compaction (memory.maybe_compact_summary):
+    # that task is prose compression with no tool use or citation formatting, so it
+    # doesn't need the main agent model's capability.
+    summary_llm_model: str = "gemini-3.5-flash-lite"
 
     # Postgres (users, conversations, messages) -- async SQLAlchemy + asyncpg.
     # Points at local Docker Postgres in dev; swappable to Railway's managed
