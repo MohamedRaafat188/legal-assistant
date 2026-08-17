@@ -3,8 +3,12 @@
 SSE event protocol (each event is one `event: <name>` + one JSON `data:` line):
 
     event: token      {"text": "<prose chunk>"}       -- repeated, streamed prose
-    event: citations  {"citations": [{"law_name", "article_number", "citation_label"}, ...]}
+    event: citations  {"citations": [{"law_name", "article_number", "article_suffix",
+                                       "citation_label"}, ...]}
                                                        -- sent once, AFTER the guard verifies.
+                                                          article_suffix is "مكرر" for a bis
+                                                          article (legally distinct from its
+                                                          base article), else null.
                                                           These are the only citations the client
                                                           may ever show.
     event: withdrawn  {"message": "<Arabic fallback>"} -- the guard hard-failed even after one

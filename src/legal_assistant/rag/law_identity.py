@@ -1,6 +1,6 @@
 """Canonical Arabic law-identity strings.
 
-There are exactly two ingested laws. Payload carries a bare `law_name`
+There are exactly three ingested laws. Payload carries a bare `law_name`
 (e.g. "القانون المدني") plus `law_number`/`law_year`, but citations must use
 one canonical full-name string consistently everywhere: the context handed
 to the LLM, what the LLM is instructed to cite, and the citation guard's
@@ -22,6 +22,7 @@ def _ar(n: int) -> str:
 _LAW_BASE_NAMES: dict[tuple[int, int], str] = {
     (174, 2025): "قانون الإجراءات الجنائية",
     (131, 1948): "القانون المدني",
+    (72, 2017): "قانون الاستثمار",
 }
 
 
@@ -38,6 +39,6 @@ def canonical_law_name(law_number: int, law_year: int, payload_law_name: str | N
 
 
 def known_law_key(law_number: int, law_year: int) -> tuple[int, int] | None:
-    """Return (law_number, law_year) if this is one of the two ingested laws, else None."""
+    """Return (law_number, law_year) if this is one of the ingested laws, else None."""
     key = (law_number, law_year)
     return key if key in _LAW_BASE_NAMES else None

@@ -2,10 +2,11 @@
 
 An Arabic-language legal research assistant for Egyptian lawyers. It answers legal questions with **article-level citations that are mechanically verified** against the retrieved law text — every citation is checked in code against what was actually retrieved before it ever reaches the user, so faithfulness to the source is prioritized over fluency.
 
-Currently covers two ingested laws:
+Currently covers three ingested laws:
 
 - قانون الإجراءات الجنائية رقم ١٧٤ لسنة ٢٠٢٥ (Criminal Procedure Law 174/2025)
 - القانون المدني رقم ١٣١ لسنة ١٩٤٨ (Civil Code 131/1948)
+- قانون الاستثمار رقم ٧٢ لسنة ٢٠١٧، بتعديلاته (Investment Law 72/2017, consolidated with its amendments)
 
 **Live demo:** a basic web UI is deployed and open to try at [legal-assistant-frontend.mohamedraafat800.workers.dev](https://legal-assistant-frontend.mohamedraafat800.workers.dev/).
 
@@ -54,6 +55,8 @@ Raw law PDFs (`data/law-131-1948.pdf`, `data/قانون الاجراءات ال�
 - **Article slicing** (`articles.py`) produces per-article records: citation label, article number, law identity, structural context (book/part/chapter), page range, and body text.
 - Inspection tools: `inspect_corpus.py` (structure report) and `preview_articles.py` (per-article JSON for manual review).
 
+**Law 72/2017 has its own extraction path** (`law72_extract.py`, `law72_glyphs.py`, `law72_corrections.py`, `law72_structure.py`, `law72_amendments.py`, `law72_amendment_map.py`, driven by `build_law72.py` and checked by `verify_law72.py`). Its source PDF is an unofficial retyped copy rather than a Gazette scan, and the law is only meaningful *consolidated* — laws 141/2019 and 160/2023 amend it in place, including two inserted مكرر ("bis") articles that are legally distinct from their base articles. The pipeline splices those amendments into the base text and emits the same chunk schema as the shared path, plus two fields laws 131/174 don't carry: `metadata.article_suffix` and `metadata.amendments`. Every intervention made to the source text is logged in `law72_audit.md`; see `arabic_ingest/MANIFEST.md` for the module-by-module map.
+
 ---
 
 ## Phase 2 — Embedding & vector indexing
@@ -63,10 +66,10 @@ Raw law PDFs (`data/law-131-1948.pdf`, `data/قانون الاجراءات ال�
 Structured articles are chunked and embedded into a searchable hybrid vector index.
 
 - **Model:** BGE-M3 (`BGEM3Embedder` in `embeddings.py`), producing **hybrid dense + sparse** vectors from a single model call.
-- **Chunking** (`chunker.py`) turns each article into a vector-DB-ready chunk: a metadata header, the faithful and normalized text, the citation label, and filterable metadata — written to `chunks_law174.json` / `chunks_law131.json`.
+- **Chunking** (`chunker.py`) turns each article into a vector-DB-ready chunk: a metadata header, the faithful and normalized text, the citation label, and filterable metadata — written to `chunks_law174.json` / `chunks_law131.json` (and `chunks_law72.json`, produced by the law-72 path above in the same schema).
 - **Vector store** (`vector_store.py`, `LawVectorStore`) sets up a Qdrant collection with named dense + sparse vectors, does idempotent upserts, and runs hybrid RRF (Reciprocal Rank Fusion) search with metadata filters.
 - **`ingest.py`** is the CLI that ties it together: chunks JSON → embed → upsert into Qdrant. Supports a local embedded Qdrant (`./qdrant_storage`, no Docker) for development.
-- Each stored point's payload includes `body_faithful` (the only text ever eligible for citation), `citation_label`, `header`, and filterable metadata (`law_number`, `article_number`, book/part/chapter, status).
+- Each stored point's payload includes `body_faithful` (the only text ever eligible for citation), `citation_label`, `header`, and filterable metadata (`law_number`, `article_number`, `article_suffix`, book/part/chapter, status).
 
 Validated vectors were later migrated **one time**, without re-embedding, from the local Docker Qdrant instance to Qdrant Cloud (`scripts/migrate_to_cloud.py`, verified by `scripts/verify_migration.py`) — this is what production reads from today.
 
@@ -95,7 +98,7 @@ This service was first tuned and validated on a CPU VPS before being migrated to
 Two distinct retrieval paths, chosen by the agent based on the kind of question being asked:
 
 - **`search_articles(query_text, top_k=5, candidate_k=20, law_number=None)`** — conceptual/semantic search. The query is embedded, then Qdrant is queried with both dense and sparse `Prefetch` clauses fused via `FusionQuery(fusion=Fusion.RRF)`. The fused candidates are then reranked through the embedding service's ColBERT `/rerank` endpoint, and the top `k` are returned.
-- **`get_article_by_number(article_number, law_number=None)`** — exact, metadata-filtered lookup with no embedding or ranking involved, since a bare article number carries little semantic signal and hybrid search tends to misrank it. Handles Arabic-Indic digits and preserves the مكرر ("bis") distinction; if `law_number` is omitted and the number exists in both laws, all matches are returned rather than guessed.
+- **`get_article_by_number(article_number, law_number=None)`** — exact, metadata-filtered lookup with no embedding or ranking involved, since a bare article number carries little semantic signal and hybrid search tends to misrank it. Handles Arabic-Indic digits and preserves the مكرر ("bis") distinction — `"11"` matches only the base article and `"11 مكرر"` only its bis article, never each other. If `law_number` is omitted and the number exists in more than one law, all matches are returned rather than guessed.
 
 `RetrievedArticle.clean_text` is always `body_faithful` — embeddings and reranking only decide *which* article surfaces; they never touch the text that ends up quoted in a citation.
 
@@ -108,7 +111,7 @@ Two distinct retrieval paths, chosen by the agent based on the kind of question 
 - **LLM:** Google Gemini via `ChatGoogleGenerativeAI`, `temperature=0` — deterministic, since legal claims and citations must be reproducible, not creative.
 - **Orchestration:** `LegalAssistantAgent` wraps a LangChain `create_agent` tool-calling graph bound to two tools (`get_article_by_number`, `search_articles`) and a Pydantic response format (`{answer_text, citations}`) that the model must fill structurally.
 - **Prompting** (`prompts.py`): a strict, formal-Arabic system prompt with explicit rules — never cite from memory, how to choose between the two retrieval tools, how to disclose repealed articles, how to handle cross-law ambiguity — paired with a JSON output contract for citations.
-- **Citation guard** (`citation_guard.py`) is plain Python, not AI: it parses the model's structured citations and checks each one against the set of articles actually retrieved this session (handling Arabic-Indic digits and the مكرر distinction), plus a regex scan for unverified inline "المادة ن" mentions in the prose. On a hard failure it regenerates once with a corrective instruction; if still invalid, it returns a fixed Arabic fallback message with zero citations rather than risk a hallucinated one.
+- **Citation guard** (`citation_guard.py`) is plain Python, not AI: it parses the model's structured citations and checks each one against the set of articles actually retrieved this session (handling Arabic-Indic digits and the مكرر distinction — the response schema carries a dedicated `article_suffix` field so the model can express "المادة ١١ مكررًا" as something other than article 11), plus a regex scan for unverified inline "المادة ن" mentions in the prose. On a hard failure it regenerates once with a corrective instruction; if still invalid, it returns a fixed Arabic fallback message with zero citations rather than risk a hallucinated one.
 - **Conversation memory** (`memory.py`): once a conversation reaches 12 turns, the oldest 6 are folded into an LLM-generated running summary, and every 6 turns after that the next full batch is folded in the same way — each compaction only processes the new batch, not the whole history, so the cost stays constant as the conversation grows. Turns not yet folded in are always kept verbatim. The summary carries no citation guarantees — citation correctness is guaranteed purely by replaying the persisted `retrieved_context`, so citations remain valid across sessions even after summarization.
 
 ---

@@ -24,8 +24,19 @@ import httpx
 
 from legal_assistant.api import app as app_module
 from legal_assistant.api.routes import chat as chat_routes
-from legal_assistant.rag.agent import TurnResult
-from legal_assistant.rag.citation_guard import FALLBACK_MESSAGE_AR
+
+# _AnswerFormat/_CitationOut are private, but importing them is the point of
+# the مكرر check below: they are the schema the LLM provider enforces
+# structurally, and the regression they guard against is a citation format the
+# guard accepts in isolation while the schema makes it impossible to emit.
+from legal_assistant.rag.agent import TurnResult, _AnswerFormat, _CitationOut
+from legal_assistant.rag.citation_guard import (
+    FALLBACK_MESSAGE_AR,
+    AllowedSet,
+    parse_answer_json,
+    verify,
+)
+from legal_assistant.rag.retrieval import MUKARRAR, Retriever
 
 FAILURES: list[str] = []
 
@@ -65,7 +76,72 @@ async def post_chat(client: httpx.AsyncClient, headers: dict, conversation_id: i
         return resp.status_code, body
 
 
+def test_mukarrar_citation_contract() -> None:
+    """A مكرر article must stay distinct from its base article, end to end.
+
+    A مكرر ("bis") article is a legally distinct provision with different
+    text, so collapsing it onto its base article is a wrong-law-quoted bug the
+    citation guard cannot catch on its own -- both directions are checked
+    here. This runs the citation through a real `_AnswerFormat` instance
+    rather than a hand-built dict: the distinction has to survive the schema
+    the provider enforces, not just the guard's own logic.
+    """
+    print("\n=== مكرر (bis) citation contract ===")
+    retriever = Retriever()
+
+    bis = retriever.get_article_by_number(f"11 {MUKARRAR}", law_number=72)
+    base = retriever.get_article_by_number(11, law_number=72)
+    check(
+        "exact lookup of «11 مكرر» returns only the bis article",
+        len(bis) == 1 and bis[0].article_suffix == MUKARRAR,
+        str([(a.chunk_id, a.article_suffix) for a in bis]),
+    )
+    check(
+        "exact lookup of «11» returns only the base article",
+        len(base) == 1 and base[0].article_suffix is None,
+        str([(a.chunk_id, a.article_suffix) for a in base]),
+    )
+    if not bis or not base:
+        return
+
+    def answer_for(article, suffix: str | None) -> dict:
+        return parse_answer_json(
+            _AnswerFormat(
+                answer_text="نص الإجابة",
+                citations=[
+                    _CitationOut(
+                        law_name=article.law_name,
+                        article_number=11,
+                        article_suffix=suffix,
+                        citation_label=article.citation_label,
+                    )
+                ],
+            ).model_dump_json()
+        )
+
+    allowed_bis = AllowedSet()
+    allowed_bis.add_many(bis)
+    allowed_base = AllowedSet()
+    allowed_base.add_many(base)
+
+    check(
+        "a مكرر citation survives the provider-enforced response schema",
+        verify(answer_for(bis[0], MUKARRAR), allowed_bis).is_valid,
+        "the schema must be able to express «مكرر» at all",
+    )
+    check(
+        "citing the BASE article is rejected when only مكرر was retrieved",
+        not verify(answer_for(base[0], None), allowed_bis).is_valid,
+    )
+    check(
+        "citing the مكرر article is rejected when only the base was retrieved",
+        not verify(answer_for(bis[0], MUKARRAR), allowed_base).is_valid,
+    )
+
+
 async def main() -> None:
+    test_mukarrar_citation_contract()
+
     transport = httpx.ASGITransport(app=app_module.app)
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
         print("\n=== Health ===")
@@ -150,6 +226,46 @@ async def main() -> None:
             "follow-up cites article 5 via rebuilt AllowedSet, not fresh retrieval",
             any(c["article_number"] == 5 for c in citations2["citations"]),
             str(citations2),
+        )
+
+        print("\n=== Law 72/2017: مكرر and consolidated text, through the API ===")
+        conv72 = await client.post(
+            "/conversations", json={"title": "اختبار قانون الاستثمار"}, headers=headers_a
+        )
+        conv72_id = conv72.json()["id"]
+
+        _, body72 = await post_chat(
+            client, headers_a, conv72_id, "ما نص المادة ١١ مكررًا من قانون الاستثمار؟"
+        )
+        events72 = parse_sse(body72)
+        citations72 = next((d for e, d in events72 if e == "citations"), {"citations": []})
+        check(
+            "a مكرر question yields a verified citation, not the guard fallback",
+            "withdrawn" not in [e for e, _ in events72] and bool(citations72["citations"]),
+            str([e for e, _ in events72]),
+        )
+        check(
+            "the citation is marked as مكرر, not collapsed onto base article 11",
+            any(
+                c["article_number"] == 11 and c.get("article_suffix") == MUKARRAR
+                for c in citations72["citations"]
+            ),
+            str(citations72),
+        )
+
+        # Amended articles keep the superseded wording AND the new wording in
+        # one body, separated by a note naming the amending law. Nothing
+        # mechanical can catch the model quoting the pre-amendment layer as
+        # current -- every citation would be legitimately verified -- so the
+        # prompt rule is all that stands between the two, and it is checked here.
+        _, body9 = await post_chat(
+            client, headers_a, conv72_id, "ما حكم المادة ٩ من قانون الاستثمار؟"
+        )
+        answer9 = "".join(d["text"] for e, d in parse_sse(body9) if e == "token")
+        check(
+            "an amended article's answer flags that it was amended, and by which law",
+            "١٦٠" in answer9 or "160" in answer9,
+            f"answer={answer9[:200]!r}",
         )
 
         print("\n=== User isolation through the API ===")

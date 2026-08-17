@@ -15,7 +15,11 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 from legal_assistant.rag.prompts import CITATION_CONTRACT_AR
-from legal_assistant.rag.retrieval import RetrievedArticle, normalize_article_number
+from legal_assistant.rag.retrieval import (
+    MUKARRAR,
+    RetrievedArticle,
+    normalize_article_number,
+)
 
 REGENERATE_INSTRUCTION_AR = """\
 تنبيه: تحتوي إجابتك السابقة على استشهاد بمادة لم يتم استرجاعها فعلياً في هذه \
@@ -77,7 +81,8 @@ class AllowedSet:
         if article.article_number is None:
             self.unnumbered_labels.add(article.citation_label)
         else:
-            self.numbered.add((law_key, article.article_number, False))
+            is_mukarrar = article.article_suffix is not None
+            self.numbered.add((law_key, article.article_number, is_mukarrar))
 
     def add_many(self, articles: list[RetrievedArticle]) -> None:
         for a in articles:
@@ -97,6 +102,7 @@ class CitationCheck:
     citation_label: str
     is_valid: bool
     reason: str = ""
+    article_suffix: str | None = None  # "مكرر" for a bis article, else None
 
 
 @dataclass
@@ -158,6 +164,13 @@ def _check_structured_citations(citations: list[dict], allowed: AllowedSet) -> l
             )
             continue
 
+        # The مكرر flag may arrive either as a dedicated `article_suffix`
+        # field (what the JSON contract asks for) or folded into the number
+        # itself as "11 مكرر" -- accept both, never collapse onto the base.
+        suffix = c.get("article_suffix")
+        if suffix and MUKARRAR in suffix:
+            is_mukarrar = True
+
         is_valid = allowed.contains_numbered(law_name, number, is_mukarrar)
         checks.append(
             CitationCheck(
@@ -166,6 +179,7 @@ def _check_structured_citations(citations: list[dict], allowed: AllowedSet) -> l
                 citation_label=citation_label,
                 is_valid=is_valid,
                 reason="" if is_valid else "article not retrieved in this conversation",
+                article_suffix=MUKARRAR if is_mukarrar else None,
             )
         )
     return checks

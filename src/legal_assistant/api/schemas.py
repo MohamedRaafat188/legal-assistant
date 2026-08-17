@@ -54,6 +54,9 @@ class ConversationOut(BaseModel):
 class CitationOut(BaseModel):
     law_name: str
     article_number: int | None
+    # "مكرر" for a bis article, else None. Defaulted because citations
+    # persisted before law 72/2017 was ingested carry no such key.
+    article_suffix: str | None = None
     citation_label: str
 
 

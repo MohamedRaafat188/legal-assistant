@@ -46,6 +46,7 @@ def article_to_context_dict(article: RetrievedArticle) -> dict:
         "law_number": article.law_number,
         "law_name": article.law_name,
         "article_number": article.article_number,
+        "article_suffix": article.article_suffix,
         "citation_label": article.citation_label,
         "clean_text": article.clean_text,
     }
@@ -58,7 +59,9 @@ def _add_context_dict_to_allowed(allowed: AllowedSet, ctx: dict) -> None:
     if article_number is None:
         allowed.unnumbered_labels.add(citation_label)
     else:
-        allowed.numbered.add((normalize_law_name(ctx.get("law_name", "")), article_number, False))
+        is_mukarrar = ctx.get("article_suffix") is not None
+        law_key = normalize_law_name(ctx.get("law_name", ""))
+        allowed.numbered.add((law_key, article_number, is_mukarrar))
 
 
 @dataclass

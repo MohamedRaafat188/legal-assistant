@@ -45,6 +45,12 @@ _log = logging.getLogger(__name__)
 class _CitationOut(BaseModel):
     law_name: str
     article_number: int | None
+    # "مكرر" for a bis article, else None. A separate nullable string rather
+    # than widening article_number to int|str: the provider enforces this
+    # schema structurally, and a scalar union is not reliably supported --
+    # without this field the model literally cannot express the distinction,
+    # and every مكرر citation fails the guard.
+    article_suffix: str | None
     citation_label: str
 
 
@@ -227,6 +233,7 @@ class LegalAssistantAgent:
                     {
                         "law_name": c.law_name,
                         "article_number": c.article_number,
+                        "article_suffix": c.article_suffix,
                         "citation_label": c.citation_label,
                     }
                     for c in guard_result.valid_citations

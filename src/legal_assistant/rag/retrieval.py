@@ -27,6 +27,10 @@ TOP_K_DEFAULT = 5
 
 _ARABIC_INDIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
 
+# The bis marker: the exact `article_suffix` payload value, and the substring
+# every inflected written form ("مكررًا", "مكرراً") contains.
+MUKARRAR = "مكرر"
+
 
 def normalize_article_number(raw: str | int) -> tuple[int, bool]:
     """Parse a (possibly Arabic-Indic) article number, preserving the مكرر distinction.
@@ -38,7 +42,7 @@ def normalize_article_number(raw: str | int) -> tuple[int, bool]:
     if isinstance(raw, int):
         return raw, False
     text = str(raw).translate(_ARABIC_INDIC_DIGITS)
-    is_mukarrar = "مكرر" in text
+    is_mukarrar = MUKARRAR in text
     match = re.search(r"\d+", text)
     if not match:
         raise ValueError(f"No article number found in {raw!r}")
@@ -55,6 +59,7 @@ class RetrievedArticle:
     law_number: int
     law_year: int
     article_number: int | None  # None for مواد الإصدار (enacting provisions)
+    article_suffix: str | None  # "مكرر" for a bis article, else None
     article_type: str
     article_status: str
     clean_text: str  # the ONLY text a citation may quote (== body_faithful)
@@ -80,6 +85,7 @@ def _to_retrieved_article(payload: dict, score: float | None) -> RetrievedArticl
         law_number=law_number,
         law_year=law_year,
         article_number=payload.get("article_number"),
+        article_suffix=payload.get("article_suffix"),
         article_type=payload.get("article_type", ""),
         article_status=payload.get("article_status", "active"),
         clean_text=payload.get("body_faithful", ""),
@@ -184,11 +190,15 @@ class Retriever:
     ) -> list[RetrievedArticle]:
         """Exact retrieval by article number, no embedding/ranking involved.
 
-        If `law_number` is None and the number exists in both laws, ALL
-        matches are returned -- never silently pick one (cross-law
+        If `law_number` is None and the number exists in more than one law,
+        ALL matches are returned -- never silently pick one (cross-law
         disambiguation). Accepts Arabic-Indic digits and preserves the مكرر
-        distinction (163 != 163 مكرر), though this corpus currently has no
-        مكرر-suffixed articles.
+        distinction (163 != 163 مكرر): "163" matches only the base article,
+        "163 مكرر" matches only its bis article. article_suffix is not
+        indexed in Qdrant (at most a couple of points ever share an
+        article_number, so filtering the small result set in Python needs no
+        index), so the distinction is applied after the exact-number scroll
+        below.
         """
         number, is_mukarrar = normalize_article_number(article_number)
 
@@ -216,12 +226,8 @@ class Retriever:
             )
 
             articles = [_to_retrieved_article(r.payload, score=None) for r in records]
-            if is_mukarrar:
-                # No مكرر-suffixed articles exist in this corpus (article_number is
-                # a plain int, with no distinguishing field) -- a مكرر reference
-                # can never match a stored point, by design: it must not
-                # silently collapse onto the base article.
-                observability.safe_update(span, output={"result_count": 0})
-                return []
+            # A مكرر reference must match only bis points, and a bare number
+            # must match only base points -- never collapse the two.
+            articles = [a for a in articles if (a.article_suffix is not None) == is_mukarrar]
             observability.safe_update(span, output={"result_count": len(articles)})
             return articles

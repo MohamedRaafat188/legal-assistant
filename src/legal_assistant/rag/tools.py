@@ -23,6 +23,7 @@ class ToolArticleResult(BaseModel):
     law_number: int
     law_year: int
     article_number: int | None
+    article_suffix: str | None
     article_type: str
     article_status: str
     citation_label: str
@@ -35,6 +36,7 @@ def _to_tool_result(article) -> ToolArticleResult:
         law_number=article.law_number,
         law_year=article.law_year,
         article_number=article.article_number,
+        article_suffix=article.article_suffix,
         article_type=article.article_type,
         article_status=article.article_status,
         citation_label=article.citation_label,
@@ -61,25 +63,34 @@ def build_retrieval_tools(
 
     @tool
     def get_article_by_number(
-        article_number: int = Field(
-            ..., description="The article number, e.g. 5 or 500. Accepts Arabic-Indic digits too."
+        article_number: int | str = Field(
+            ...,
+            description=(
+                "The article number, e.g. 5 or 500. Accepts Arabic-Indic digits too. For a "
+                "'مكرر' (bis) article -- a legally distinct article inserted after the base "
+                "one by an amendment, e.g. المادة ١١ مكررًا -- append 'مكرر' to the number, "
+                "e.g. \"11 مكرر\". Never omit it when the question says مكرر: article 11 and "
+                "article 11 مكرر are different articles with different text."
+            ),
         ),
         law_number: int | None = Field(
             default=None,
             description=(
-                "174 for قانون الإجراءات الجنائية (Law 174/2025), or 131 for القانون المدني "
-                "(Law 131/1948). Omit if the law is not specified or unclear in the question -- "
-                "if the number exists in both laws, all matches are returned so the caller must "
-                "never silently guess which one."
+                "174 for قانون الإجراءات الجنائية (Law 174/2025), 131 for القانون المدني "
+                "(Law 131/1948), or 72 for قانون الاستثمار (Law 72/2017). Omit if the law is "
+                "not specified or unclear in the question -- if the number exists in more than "
+                "one law, all matches are returned so the caller must never silently guess "
+                "which one."
             ),
         ),
     ) -> list[ToolArticleResult]:
-        """Fetch a SPECIFIC article by its exact number (e.g. "نص المادة 500 من قانون الإجراءات الجنائية؟",
-        "المادة 5 من القانون المدني"). Use this whenever the question names an explicit article
-        number, NOT for conceptual/topic questions -- a bare number carries almost no semantic
-        signal, so semantic search routinely misranks these. Returns an empty list if the
-        article number does not exist (including مواد الإصدار / enacting provisions, which have
-        no article number and can only be found via search_articles)."""
+        """Fetch a SPECIFIC article by its exact number (e.g. "نص المادة 500 من قانون
+        الإجراءات الجنائية؟", "المادة 5 من القانون المدني", "المادة 11 مكررًا من قانون
+        الاستثمار"). Use this whenever the question names an explicit article number, NOT
+        for conceptual/topic questions -- a bare number carries almost no semantic signal,
+        so semantic search routinely misranks these. Returns an empty list if the article
+        number does not exist (including مواد الإصدار / enacting provisions, which have no
+        article number and can only be found via search_articles)."""
         articles = retriever.get_article_by_number(article_number, law_number=law_number)
         _notify("get_article_by_number", articles)
         return [_to_tool_result(a) for a in articles]
@@ -89,15 +100,16 @@ def build_retrieval_tools(
         query_text: str = Field(..., description="The legal question or topic, in Arabic."),
         law_number: int | None = Field(
             default=None,
-            description="Restrict to one law (174 or 131) if the question clearly names it; omit otherwise.",
+            description="Restrict to one law (174, 131, or 72) if the question clearly names it; "
+            "omit otherwise.",
         ),
     ) -> list[ToolArticleResult]:
-        """Conceptual/topic search over the two ingested laws (قانون الإجراءات الجنائية رقم ١٧٤
-        لسنة ٢٠٢٥ and القانون المدني رقم ١٣١ لسنة ١٩٤٨) using hybrid semantic+lexical retrieval
-        with rerank. Use this for questions about a legal concept, procedure, or topic where no
-        specific article number is named (e.g. "ما هي شروط التصالح في الجنح؟"). This is also how
-        to find مواد الإصدار (enacting provisions), which have no article number and are never
-        returned by get_article_by_number."""
+        """Conceptual/topic search over the three ingested laws (قانون الإجراءات الجنائية رقم ١٧٤
+        لسنة ٢٠٢٥، القانون المدني رقم ١٣١ لسنة ١٩٤٨، وقانون الاستثمار رقم ٧٢ لسنة ٢٠١٧) using
+        hybrid semantic+lexical retrieval with rerank. Use this for questions about a legal
+        concept, procedure, or topic where no specific article number is named (e.g. "ما هي شروط
+        التصالح في الجنح؟"). This is also how to find مواد الإصدار (enacting provisions), which
+        have no article number and are never returned by get_article_by_number."""
         articles = retriever.search_articles(query_text, law_number=law_number)
         _notify("search_articles", articles)
         return [_to_tool_result(a) for a in articles]
