@@ -63,16 +63,13 @@ class RetrievedArticle:
     article_type: str
     article_status: str
     clean_text: str  # the ONLY text a citation may quote (== body_faithful)
+    # Structural header from the payload ("قانون ... / الباب ... / مادة (ن)").
+    # Carried for callers and debugging; NOT how articles reach the model --
+    # they reach it as serialized ToolArticleResult fields (see rag/tools.py),
+    # which is also why `article_status` is a field the system prompt reasons
+    # about by name rather than a rendered warning line.
     header: str
     score: float | None  # None for exact-lookup hits (no ranking involved)
-
-    def to_context_block(self) -> str:
-        """Render this article for injection into the LLM prompt."""
-        lines = [f"[{self.citation_label}]", self.header]
-        if self.article_status == "repealed":
-            lines.append("⚠ ملغاة — هذه المادة لم تعد سارية")
-        lines.append(self.clean_text)
-        return "\n".join(lines)
 
 
 def _to_retrieved_article(payload: dict, score: float | None) -> RetrievedArticle:

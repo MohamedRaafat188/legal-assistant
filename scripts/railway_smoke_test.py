@@ -32,6 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from phase6_validate import wait_for_trace  # noqa: E402
 
 from legal_assistant import observability  # noqa: E402
+from legal_assistant.rag.retrieval import MUKARRAR  # noqa: E402
 
 FAILURES: list[str] = []
 
@@ -127,6 +128,47 @@ async def main(base_url: str) -> None:
         status2, body2 = await post_chat(client, headers, conversation_id, "وما حكم المادة 6؟")
         events2 = parse_sse(body2)
         check("second turn in same conversation succeeds", status2 == 200 and "error" not in [e for e, _ in events2])
+
+        print("\n=== Law 72/2017 (confirms the deployed code, not just the data, knows it) ===")
+        # Law 72's chunks were written straight to Qdrant Cloud, so they go live
+        # independently of any deploy. These checks are what distinguish a
+        # deployment that actually carries the law-72 code from one still
+        # serving the old two-law prompt against the new data.
+        conv72 = await client.post(
+            "/conversations", json={"title": "اختبار قانون الاستثمار"}, headers=headers
+        )
+        conv72_id = conv72.json()["id"]
+
+        _, body72 = await post_chat(
+            client, headers, conv72_id, "ما نص المادة ١١ مكررًا من قانون الاستثمار؟"
+        )
+        events72 = parse_sse(body72)
+        names72 = [e for e, _ in events72]
+        citations72 = next((d for e, d in events72 if e == "citations"), {"citations": []})
+        answered = "withdrawn" not in names72 and "error" not in names72
+        check(
+            "a law-72 مكرر question is answered, not refused as out of scope",
+            answered and bool(citations72["citations"]),
+            str(names72),
+        )
+        check(
+            "the live citation is marked مكرر, not collapsed onto base article 11",
+            any(
+                c["article_number"] == 11 and c.get("article_suffix") == MUKARRAR
+                for c in citations72["citations"]
+            ),
+            str(citations72),
+        )
+
+        _, body9 = await post_chat(
+            client, headers, conv72_id, "ما حكم المادة ٩ من قانون الاستثمار؟"
+        )
+        answer9 = "".join(d["text"] for e, d in parse_sse(body9) if e == "token")
+        check(
+            "an amended article's answer names the amending law",
+            "١٦٠" in answer9 or "160" in answer9,
+            f"answer={answer9[:160]!r}",
+        )
 
         print("\n=== User isolation ===")
         token_b, _ = await register(client, f"railway_lawyer_b_{suffix}", "another_password_123")
