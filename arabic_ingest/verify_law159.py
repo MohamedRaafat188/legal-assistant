@@ -79,11 +79,25 @@ check("the explanatory memorandum never entered the corpus",
 
 print("\n== status ==")
 repealed = [c for c in subs if c["metadata"]["article_status"] == "repealed"]
+# Nine the source itself marks ملغاة, plus article 94, repealed by law 194/2020
+# -- which post-dates the source edition and comes from law159_corrections.
 expected = {(21, "مكرر"), (22, None), (23, None), (36, None), (83, None),
-            (91, None), (92, None), (93, None), (183, None)}
+            (91, None), (92, None), (93, None), (94, None), (183, None)}
 got = {(c["metadata"]["article_number"], c["metadata"]["article_suffix"]) for c in repealed}
-check("exactly the nine repealed articles", got == expected, str(got ^ expected))
-check("repealed articles are kept, not dropped", len(repealed) == 9)
+check("exactly the ten repealed articles", got == expected, str(got ^ expected))
+check("repealed articles are kept, not dropped", len(repealed) == 10)
+
+art94 = next(c for c in subs if c["metadata"]["article_number"] == 94
+             and not c["metadata"]["article_suffix"])
+check("article 94 is flagged repealed by law 194/2020",
+      art94["metadata"]["article_status"] == "repealed"
+      and any(r["law_number"] == 194 and r["law_year"] == 2020
+              for r in art94["metadata"]["amendments"]),
+      str(art94["metadata"]["amendments"]))
+check("article 94 keeps its pre-repeal wording, and the note comes first",
+      art94["body_faithful"].startswith("ملغاة بالقانون رقم ١٩٤")
+      and "لا يجوز لعضو مجلس" in art94["body_faithful"],
+      repr(art94["body_faithful"][:90]))
 check("article 127 is active (only a phrase in it was struck out)",
       next(c for c in subs if c["metadata"]["article_number"] == 127
            and not c["metadata"]["article_suffix"])["metadata"]["article_status"] == "active")

@@ -48,10 +48,20 @@ writing law, so it is surfaced instead of guessed.
   ١٣٩ مكرراً
       مادة ١٢٩ مكرراً "٧" cross-refers to «المادة (١٣٩ مكرراً "٢")», but article 139 has no مكرر and the prohibition it describes is in ١٢٩ مكرراً "٢". Reported, not corrected: rewriting a cross-reference is rewriting the law.
 
+## 3b. Amendments supplied by the project owner (1)
+
+The source edition is consolidated to 2018, so a later amendment cannot
+appear in it. These come from the project owner, are applied against an
+anchor phrase, and fail the build rather than guess if that anchor moves.
+Unlike the repeals the source itself marks, the pre-repeal wording is kept.
+
+  مادة (٩٤)  repealed by قانون ١٩٤ لسنة ٢٠٢٠
+      note: ملغاة بالقانون رقم ١٩٤ لسنة ٢٠٢٠ بشأن إصدار قانون البنك المركزي والجهاز المصرفي المنشور بالجريدة الرسمية العدد ٣٧ مكرر (و) في ١٥ /٩/ ٢٠٢٠ . وفيما يلي نص المادة قبل إلغائها:
+
 ## 4. Articles parsed (219)
 
   6 issuance + 213 substantive (184 base + 29 مكرر)
-  repealed (kept, marked article_status="repealed"): مادة (٢١ مكررًا), مادة (٢٢), مادة (٢٣), مادة (٣٦), مادة (٨٣), مادة (٩١), مادة (٩٢), مادة (٩٣), مادة (١٨٣)
+  repealed (kept, marked article_status="repealed"): مادة (٢١ مكررًا), مادة (٢٢), مادة (٢٣), مادة (٣٦), مادة (٨٣), مادة (٩١), مادة (٩٢), مادة (٩٣), مادة (٩٤), مادة (١٨٣)
 
 ### مكرر articles and their designations
 
@@ -85,7 +95,7 @@ writing law, so it is surfaced instead of guessed.
   مادة (١٦٠ مكررًا)                -> article_suffix='مكرر'
   مادة (١٦٤ مكررًا)                -> article_suffix='مكرر'
 
-## 5. Amendments recorded (92 notes across 79 articles)
+## 5. Amendments recorded (93 notes across 80 articles)
 
 Parsed out of the notes the source itself carries; the notes stay
 in body_faithful as well.
@@ -96,5 +106,6 @@ in body_faithful as well.
   قانون ١٧ لسنة ٢٠١٥   x1
   قانون ٢١٢ لسنة ١٩٩٤   x1
   قانون ١٥٩ لسنة ١٩٩٨   x1
+  قانون ١٩٤ لسنة ٢٠٢٠   x1
   قانون ٦٨ لسنة ٢٠٠٩   x1
   قانون ٢٣٠ لسنة ١٩٨٩   x1

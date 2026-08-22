@@ -57,12 +57,22 @@ raa/zayn transposition the font produces (`المرافق` extracts as `الم �
                            universe, plus enumerated letter transpositions
     law159_structure.py    article slicing, bis-series designations, الباب /
                            الفصل / section context, repeal detection
+    law159_corrections.py  amendments enacted after the source edition was
+                           consolidated (2018), supplied by the project owner
+                           and applied against an anchor phrase
     build_law159.py        run the whole pipeline -> chunks_law159.json + audit
     verify_law159.py       coverage, schema parity, status and Qdrant checks
     ingest_via_service.py  embed via the deployed service instead of a local
                            BGE-M3, for boxes without FlagEmbedding installed
 
     python build_law159.py && python verify_law159.py --cloud
+
+The source edition is consolidated only to 2018, so anything later is invisible
+to it by construction — law 194/2020's repeal of article 94, for instance.
+Those live in `law159_corrections.py`, are logged in the audit as owner-supplied
+rather than read off the page, and unlike the repeals the source itself marks,
+they keep the pre-repeal wording (a lawyer asking after a repealed provision
+usually needs to know what it said).
 
 Only the enacted text is ingested: pages 84–106 are a `مذكرة إيضاحية`
 (explanatory memorandum to the bill), which is legislative history rather than

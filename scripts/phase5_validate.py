@@ -213,6 +213,26 @@ def test_mukarrar_series_are_distinct() -> None:
         str([(a.chunk_id, a.article_status) for a in repealed]),
     )
 
+    # Article 94 is the one repealed article that still carries its own text:
+    # law 194/2020 post-dates the source edition, so the repeal is applied as an
+    # owner-supplied correction and the pre-repeal wording is kept rather than
+    # dropped. The hazard is that surviving text reads as current law, which
+    # nothing mechanical can catch -- prompt rule ٨'s repeal case is the guard,
+    # and the API-level check further down is what exercises it.
+    art94 = retriever.get_article_by_number(94, law_number=159)
+    check(
+        "article 94 is flagged repealed even though its text survives",
+        len(art94) == 1 and art94[0].article_status == "repealed",
+        str([(a.chunk_id, a.article_status) for a in art94]),
+    )
+    check(
+        "article 94's body leads with the repeal note, then the old wording",
+        bool(art94)
+        and art94[0].clean_text.startswith("ملغاة بالقانون رقم ١٩٤")
+        and "لا يجوز لعضو مجلس" in art94[0].clean_text,
+        repr(art94[0].clean_text[:90]) if art94 else "",
+    )
+
 
 async def main() -> None:
     test_mukarrar_citation_contract()
@@ -385,6 +405,28 @@ async def main() -> None:
             "a repealed article is reported as repealed, not served as live law",
             "ملغا" in answer_rep or "ألغيت" in answer_rep or "إلغا" in answer_rep,
             f"answer={answer_rep[:200]!r}",
+        )
+
+        # Article 94 keeps its pre-repeal text, so the answer has wording it
+        # could quote as if it were in force. It must lead with the repeal.
+        _, body94 = await post_chat(
+            client, headers_a, conv159_id, "ما حكم المادة ٩٤ من قانون الشركات؟"
+        )
+        answer94 = "".join(d["text"] for e, d in parse_sse(body94) if e == "token")
+        check(
+            "article 94's answer says it is repealed, and names law 194/2020",
+            any(w in answer94 for w in ("ملغا", "ألغيت", "إلغا"))
+            and ("١٩٤" in answer94 or "194" in answer94),
+            f"answer={answer94[:220]!r}",
+        )
+        repeal_stated_at = min(
+            (answer94.find(w) for w in ("ملغا", "ألغيت", "إلغا") if w in answer94),
+            default=-1,
+        )
+        check(
+            "the repeal is stated up front, before any of the old wording",
+            0 <= repeal_stated_at < 200,
+            f"repeal first mentioned at char {repeal_stated_at}",
         )
 
         print("\n=== User isolation through the API ===")

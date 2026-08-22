@@ -34,6 +34,7 @@ SP = Path(__file__).parent
 sys.path.insert(0, str(SP))
 
 from arabic_text import normalize_for_embedding  # noqa: E402
+from law159_corrections import apply as apply_post_source_amendments  # noqa: E402
 from law159_extract import extract_body  # noqa: E402
 from law159_structure import (  # noqa: E402
     INT_TO_ORDINAL,
@@ -180,6 +181,20 @@ def main() -> int:
     if missing or len(set(keys)) != len(keys):
         print(f"ERROR: article numbering broken. missing={missing}", file=sys.stderr)
         return 1
+
+    # Amendments enacted after the source edition was consolidated. Applied
+    # after parsing, before anything reads status or bodies.
+    applied = apply_post_source_amendments(articles)
+    audit.append(f"\n## 3b. Amendments supplied by the project owner ({len(applied)})\n")
+    audit.append("The source edition is consolidated to 2018, so a later amendment cannot\n"
+                 "appear in it. These come from the project owner, are applied against an\n"
+                 "anchor phrase, and fail the build rather than guess if that anchor moves.\n"
+                 "Unlike the repeals the source itself marks, the pre-repeal wording is kept.\n")
+    for article, amendment in applied:
+        audit.append(f"  {article_label(article)}  repealed by قانون "
+                     f"{to_arabic_digits(amendment.law_number)} لسنة "
+                     f"{to_arabic_digits(amendment.law_year)}")
+        audit.append(f"      note: {amendment.note}")
 
     bis = [a for a in substantive if a.suffix]
     repealed = [a for a in substantive if a.status == "repealed"]

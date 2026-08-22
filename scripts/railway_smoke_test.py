@@ -214,6 +214,26 @@ async def main(base_url: str) -> None:
             f"answer={answer_rep[:160]!r}",
         )
 
+        # Article 94 still carries its pre-repeal wording (law 194/2020
+        # post-dates the source edition, so the repeal is an owner-supplied
+        # correction rather than a note on the page). That surviving text is
+        # quotable as though it were in force, and only prompt rule ٨'s repeal
+        # case stands between the two -- so the live check is that the repeal
+        # leads the answer.
+        _, body94 = await post_chat(
+            client, headers, conv159_id, "ما حكم المادة ٩٤ من قانون الشركات؟"
+        )
+        answer94 = "".join(d["text"] for e, d in parse_sse(body94) if e == "token")
+        repeal_at = min(
+            (answer94.find(w) for w in ("ملغا", "ألغيت", "إلغا") if w in answer94),
+            default=-1,
+        )
+        check(
+            "article 94 is reported repealed, up front, naming law 194/2020",
+            0 <= repeal_at < 200 and ("١٩٤" in answer94 or "194" in answer94),
+            f"repeal at char {repeal_at}; answer={answer94[:160]!r}",
+        )
+
         print("\n=== User isolation ===")
         token_b, _ = await register(client, f"railway_lawyer_b_{suffix}", "another_password_123")
         headers_b = {"Authorization": f"Bearer {token_b}"}
