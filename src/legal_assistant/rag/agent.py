@@ -45,11 +45,13 @@ _log = logging.getLogger(__name__)
 class _CitationOut(BaseModel):
     law_name: str
     article_number: int | None
-    # "مكرر" for a bis article, else None. A separate nullable string rather
-    # than widening article_number to int|str: the provider enforces this
-    # schema structurally, and a scalar union is not reliably supported --
-    # without this field the model literally cannot express the distinction,
-    # and every مكرر citation fails the guard.
+    # The full bis designation ("مكرر", "مكرر ١", "مكرر أ"), else None. A
+    # separate nullable string rather than widening article_number to int|str:
+    # the provider enforces this schema structurally, and a scalar union is not
+    # reliably supported -- without this field the model literally cannot
+    # express the distinction, and every مكرر citation fails the guard. It
+    # carries the whole designation, not a flag, because law 159/1981 numbers
+    # its bis articles in series (١٢٩ مكرراً "١".."٩") that a flag would merge.
     article_suffix: str | None
     citation_label: str
 

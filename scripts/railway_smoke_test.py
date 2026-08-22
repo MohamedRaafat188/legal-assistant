@@ -170,6 +170,50 @@ async def main(base_url: str) -> None:
             f"answer={answer9[:160]!r}",
         )
 
+        print("\n=== Law 159/1981 (the bis series the suffix widening is for) ===")
+        # Same reasoning as law 72: the chunks reach Qdrant Cloud independently
+        # of any deploy, so what these checks actually prove is that the running
+        # code carries the widened article_suffix. A deployment still on the
+        # bis-flag build would answer, but could not tell «١٢٩ مكررًا "٥"» from
+        # its nine siblings.
+        conv159 = await client.post(
+            "/conversations", json={"title": "اختبار قانون الشركات"}, headers=headers
+        )
+        conv159_id = conv159.json()["id"]
+
+        _, body159 = await post_chat(
+            client, headers, conv159_id, 'ما نص المادة ١٢٩ مكررًا "٥" من قانون الشركات؟'
+        )
+        events159 = parse_sse(body159)
+        names159 = [e for e, _ in events159]
+        citations159 = next((d for e, d in events159 if e == "citations"), {"citations": []})
+        answered159 = "withdrawn" not in names159 and "error" not in names159
+        check(
+            "a law-159 question is answered, not refused as out of scope",
+            answered159 and bool(citations159["citations"]),
+            str(names159),
+        )
+        check(
+            "the live citation names the exact sibling, not just «مكرر»",
+            any(
+                c["article_number"] == 129
+                and c.get("article_suffix") not in (None, MUKARRAR)
+                and MUKARRAR in c["article_suffix"]
+                for c in citations159["citations"]
+            ),
+            str(citations159),
+        )
+
+        _, body_rep = await post_chat(
+            client, headers, conv159_id, "ما نص المادة ٢٢ من قانون الشركات؟"
+        )
+        answer_rep = "".join(d["text"] for e, d in parse_sse(body_rep) if e == "token")
+        check(
+            "a repealed article is reported as repealed, not served as live law",
+            any(w in answer_rep for w in ("ملغا", "ألغيت", "إلغا")),
+            f"answer={answer_rep[:160]!r}",
+        )
+
         print("\n=== User isolation ===")
         token_b, _ = await register(client, f"railway_lawyer_b_{suffix}", "another_password_123")
         headers_b = {"Authorization": f"Bearer {token_b}"}

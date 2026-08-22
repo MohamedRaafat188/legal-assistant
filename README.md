@@ -2,11 +2,12 @@
 
 An Arabic-language legal research assistant for Egyptian lawyers. It answers legal questions with **article-level citations that are mechanically verified** against the retrieved law text — every citation is checked in code against what was actually retrieved before it ever reaches the user, so faithfulness to the source is prioritized over fluency.
 
-Currently covers three ingested laws:
+Currently covers four ingested laws:
 
 - قانون الإجراءات الجنائية رقم ١٧٤ لسنة ٢٠٢٥ (Criminal Procedure Law 174/2025)
 - القانون المدني رقم ١٣١ لسنة ١٩٤٨ (Civil Code 131/1948)
 - قانون الاستثمار رقم ٧٢ لسنة ٢٠١٧، بتعديلاته (Investment Law 72/2017, consolidated with its amendments)
+- قانون الشركات رقم ١٥٩ لسنة ١٩٨١، بتعديلاته (Companies Law 159/1981, consolidated with its amendments)
 
 **Live demo:** a basic web UI is deployed and open to try at [legal-assistant-frontend.mohamedraafat800.workers.dev](https://legal-assistant-frontend.mohamedraafat800.workers.dev/).
 
@@ -56,6 +57,8 @@ Raw law PDFs (`data/law-131-1948.pdf`, `data/قانون الاجراءات ال�
 - Inspection tools: `inspect_corpus.py` (structure report) and `preview_articles.py` (per-article JSON for manual review).
 
 **Law 72/2017 has its own extraction path** (`law72_extract.py`, `law72_glyphs.py`, `law72_corrections.py`, `law72_structure.py`, `law72_amendments.py`, `law72_amendment_map.py`, driven by `build_law72.py` and checked by `verify_law72.py`). Its source PDF is an unofficial retyped copy rather than a Gazette scan, and the law is only meaningful *consolidated* — laws 141/2019 and 160/2023 amend it in place, including two inserted مكرر ("bis") articles that are legally distinct from their base articles. The pipeline splices those amendments into the base text and emits the same chunk schema as the shared path, plus two fields laws 131/174 don't carry: `metadata.article_suffix` and `metadata.amendments`. Every intervention made to the source text is logged in `law72_audit.md`; see `arabic_ingest/MANIFEST.md` for the module-by-module map.
+
+**Law 159/1981 has its own path too** (`law159_extract.py`, `law159_glyphs.py`, `law159_structure.py`, driven by `build_law159.py` and checked by `verify_law159.py`). Its source is a single already-consolidated annotated edition — every amendment from 1994 to 2018 is woven in, each marked by a note naming the amending law — so there is no splicing engine; the notes stay in `body_faithful` and are also parsed into `metadata.amendments`. What the law does force is a change in how bis articles are keyed: it numbers them in *series*, with eleven separate articles on number 129 (base, مكرر, and مكرر "١"–"٩", governing one-person companies) and five on 135. So `article_suffix` carries the **full designation** (`"مكرر"`, `"مكرر ١"`, `"مكرر أ"`) rather than a bis flag — with a flag, ten of those eleven would share one citation-guard key, and a citation to one sibling would verify against a retrieval of another. Only enacted text is ingested: the `مذكرة إيضاحية` (explanatory memorandum to the bill) is legislative history, not law, and is cut. Interventions are logged in `law159_audit.md`.
 
 ---
 

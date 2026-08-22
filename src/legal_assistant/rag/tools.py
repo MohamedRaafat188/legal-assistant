@@ -70,14 +70,19 @@ def build_retrieval_tools(
                 "'مكرر' (bis) article -- a legally distinct article inserted after the base "
                 "one by an amendment, e.g. المادة ١١ مكررًا -- append 'مكرر' to the number, "
                 "e.g. \"11 مكرر\". Never omit it when the question says مكرر: article 11 and "
-                "article 11 مكرر are different articles with different text."
+                "article 11 مكرر are different articles with different text. A law may also "
+                "number its bis articles in a series under one number, in which case append "
+                "the whole designation: \"129 مكرر 1\" for مادة ١٢٩ مكرراً \"١\", \"135 مكرر أ\" "
+                "for مادة ١٣٥ مكرراً \"أ\" -- each is its own article, so \"129 مكرر 1\" will "
+                "never return \"129 مكرر 2\"."
             ),
         ),
         law_number: int | None = Field(
             default=None,
             description=(
                 "174 for قانون الإجراءات الجنائية (Law 174/2025), 131 for القانون المدني "
-                "(Law 131/1948), or 72 for قانون الاستثمار (Law 72/2017). Omit if the law is "
+                "(Law 131/1948), 72 for قانون الاستثمار (Law 72/2017), or 159 for قانون "
+                "الشركات (Law 159/1981). Omit if the law is "
                 "not specified or unclear in the question -- if the number exists in more than "
                 "one law, all matches are returned so the caller must never silently guess "
                 "which one."
@@ -100,12 +105,13 @@ def build_retrieval_tools(
         query_text: str = Field(..., description="The legal question or topic, in Arabic."),
         law_number: int | None = Field(
             default=None,
-            description="Restrict to one law (174, 131, or 72) if the question clearly names it; "
-            "omit otherwise.",
+            description="Restrict to one law (174, 131, 72, or 159) if the question clearly "
+            "names it; omit otherwise.",
         ),
     ) -> list[ToolArticleResult]:
-        """Conceptual/topic search over the three ingested laws (قانون الإجراءات الجنائية رقم ١٧٤
-        لسنة ٢٠٢٥، القانون المدني رقم ١٣١ لسنة ١٩٤٨، وقانون الاستثمار رقم ٧٢ لسنة ٢٠١٧) using
+        """Conceptual/topic search over the four ingested laws (قانون الإجراءات الجنائية رقم ١٧٤
+        لسنة ٢٠٢٥، القانون المدني رقم ١٣١ لسنة ١٩٤٨، قانون الاستثمار رقم ٧٢ لسنة ٢٠١٧، وقانون
+        الشركات رقم ١٥٩ لسنة ١٩٨١) using
         hybrid semantic+lexical retrieval with rerank. Use this for questions about a legal
         concept, procedure, or topic where no specific article number is named (e.g. "ما هي شروط
         التصالح في الجنح؟"). This is also how to find مواد الإصدار (enacting provisions), which

@@ -23,7 +23,7 @@ from legal_assistant.config import get_settings
 from legal_assistant.db.models import Conversation, Message
 from legal_assistant.llm import get_llm
 from legal_assistant.rag.citation_guard import AllowedSet, normalize_law_name
-from legal_assistant.rag.retrieval import RetrievedArticle
+from legal_assistant.rag.retrieval import RetrievedArticle, normalize_article_suffix
 
 # Turns (user+assistant pairs) kept verbatim as "working memory" fed to the agent.
 WORKING_MEMORY_TURNS = 6
@@ -59,9 +59,12 @@ def _add_context_dict_to_allowed(allowed: AllowedSet, ctx: dict) -> None:
     if article_number is None:
         allowed.unnumbered_labels.add(citation_label)
     else:
-        is_mukarrar = ctx.get("article_suffix") is not None
+        # Normalized through the same folding the live path uses, so a replayed
+        # row keys identically to a fresh retrieval. Rows persisted before the
+        # field existed carry no key at all and fold to None, as they should.
+        suffix = normalize_article_suffix(ctx.get("article_suffix"))
         law_key = normalize_law_name(ctx.get("law_name", ""))
-        allowed.numbered.add((law_key, article_number, is_mukarrar))
+        allowed.numbered.add((law_key, article_number, suffix))
 
 
 @dataclass

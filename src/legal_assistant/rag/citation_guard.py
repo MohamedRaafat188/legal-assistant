@@ -19,6 +19,7 @@ from legal_assistant.rag.retrieval import (
     MUKARRAR,
     RetrievedArticle,
     normalize_article_number,
+    normalize_article_suffix,
 )
 
 REGENERATE_INSTRUCTION_AR = """\
@@ -37,9 +38,12 @@ FALLBACK_MESSAGE_AR = (
 _ARABIC_INDIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
 _EASTERN_ARABIC_INDIC_DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹", "0123456789")
 
+# The bis designation is captured whole (marker + any quoted "١"/"أ" sibling
+# tag) so an inline mention resolves to the same key the structured citation
+# would -- see normalize_article_suffix.
 _INLINE_ARTICLE_RE = re.compile(
     r"(?:ال)?ماد[ةه]\s*(?:رقم)?\s*[()]*\s*(?P<num>[0-9٠-٩۰-۹]+)\s*[()]*"
-    r"(?P<mukarrar>\s*مكرر)?"
+    r"(?P<suffix>\s*مكرر\S*(?:\s*[\"'«][^\"'»]{1,4}[\"'»])?)?"
 )
 
 
@@ -62,7 +66,13 @@ def normalize_law_name(name: str) -> str:
     return text
 
 
-ArticleKey = tuple[str, int, bool]  # (normalized_law_name, article_number, is_mukarrar)
+# (normalized_law_name, article_number, normalized_suffix). The suffix is the
+# full designation rather than a bis flag: law 159/1981 has ten articles on
+# number 129 (base, مكرر, and مكرر "١".."٩") and five on 135, so a boolean here
+# would let a citation of مادة ١٢٩ مكرراً "٧" verify against a retrieval of
+# "٢" -- the guard passing something it never saw, which is the one thing it
+# exists to prevent.
+ArticleKey = tuple[str, int, str | None]
 
 
 @dataclass
@@ -81,15 +91,18 @@ class AllowedSet:
         if article.article_number is None:
             self.unnumbered_labels.add(article.citation_label)
         else:
-            is_mukarrar = article.article_suffix is not None
-            self.numbered.add((law_key, article.article_number, is_mukarrar))
+            suffix = normalize_article_suffix(article.article_suffix)
+            self.numbered.add((law_key, article.article_number, suffix))
 
     def add_many(self, articles: list[RetrievedArticle]) -> None:
         for a in articles:
             self.add(a)
 
-    def contains_numbered(self, law_name: str, article_number: int, is_mukarrar: bool) -> bool:
-        return (normalize_law_name(law_name), article_number, is_mukarrar) in self.numbered
+    def contains_numbered(
+        self, law_name: str, article_number: int, article_suffix: str | None
+    ) -> bool:
+        key = (normalize_law_name(law_name), article_number, article_suffix)
+        return key in self.numbered
 
     def contains_label(self, citation_label: str) -> bool:
         return citation_label in self.all_labels
@@ -102,14 +115,16 @@ class CitationCheck:
     citation_label: str
     is_valid: bool
     reason: str = ""
-    article_suffix: str | None = None  # "مكرر" for a bis article, else None
+    # Normalized full designation ("مكرر", "مكرر 1"), else None. Defaulted so
+    # the positional unparseable-number construction below still works.
+    article_suffix: str | None = None
 
 
 @dataclass
 class InlineRef:
     raw_match: str
     article_number: int
-    is_mukarrar: bool
+    article_suffix: str | None
     is_verified: bool
 
 
@@ -157,21 +172,22 @@ def _check_structured_citations(citations: list[dict], allowed: AllowedSet) -> l
             continue
 
         try:
-            number, is_mukarrar = normalize_article_number(raw_number)
+            number, suffix = normalize_article_number(raw_number)
         except ValueError:
             checks.append(
                 CitationCheck(law_name, None, citation_label, False, "unparseable article_number")
             )
             continue
 
-        # The مكرر flag may arrive either as a dedicated `article_suffix`
+        # The designation may arrive either in the dedicated `article_suffix`
         # field (what the JSON contract asks for) or folded into the number
-        # itself as "11 مكرر" -- accept both, never collapse onto the base.
-        suffix = c.get("article_suffix")
-        if suffix and MUKARRAR in suffix:
-            is_mukarrar = True
+        # itself as '129 مكرراً "1"' -- accept both. The dedicated field wins
+        # when both are present, since it is the one the contract specifies.
+        declared = normalize_article_suffix(c.get("article_suffix"))
+        if declared and MUKARRAR in declared:
+            suffix = declared
 
-        is_valid = allowed.contains_numbered(law_name, number, is_mukarrar)
+        is_valid = allowed.contains_numbered(law_name, number, suffix)
         checks.append(
             CitationCheck(
                 law_name=law_name,
@@ -179,7 +195,7 @@ def _check_structured_citations(citations: list[dict], allowed: AllowedSet) -> l
                 citation_label=citation_label,
                 is_valid=is_valid,
                 reason="" if is_valid else "article not retrieved in this conversation",
-                article_suffix=MUKARRAR if is_mukarrar else None,
+                article_suffix=suffix,
             )
         )
     return checks
@@ -193,9 +209,18 @@ def _scan_inline_refs(answer_text: str, allowed: AllowedSet) -> list[InlineRef]:
         if not num_str.isdigit():
             continue
         number = int(num_str)
-        is_mukarrar = bool(m.group("mukarrar"))
-        verified = any(number == n and is_mukarrar == mk for (_law, n, mk) in allowed.numbered)
-        refs.append(InlineRef(raw_match=m.group(0), article_number=number, is_mukarrar=is_mukarrar, is_verified=verified))
+        suffix = normalize_article_suffix(m.group("suffix"))
+        verified = any(
+            number == n and suffix == sfx for (_law, n, sfx) in allowed.numbered
+        )
+        refs.append(
+            InlineRef(
+                raw_match=m.group(0),
+                article_number=number,
+                article_suffix=suffix,
+                is_verified=verified,
+            )
+        )
     return refs
 
 

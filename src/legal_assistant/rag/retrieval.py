@@ -27,26 +27,64 @@ TOP_K_DEFAULT = 5
 
 _ARABIC_INDIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
 
-# The bis marker: the exact `article_suffix` payload value, and the substring
-# every inflected written form ("مكررًا", "مكرراً") contains.
+# The bis marker: the stem of `article_suffix`, and the substring every
+# inflected written form ("مكررًا", "مكرراً") contains.
 MUKARRAR = "مكرر"
 
+_HARAKAT_RE = re.compile(r"[ً-ْ]")
+_SUFFIX_PUNCT_RE = re.compile(r"[\"'«»()\[\]]")
 
-def normalize_article_number(raw: str | int) -> tuple[int, bool]:
+
+def normalize_article_suffix(raw: str | None) -> str | None:
+    """Fold an article's bis designation to one canonical, comparable form.
+
+    A مكرر article is legally distinct from its base article, and -- as law
+    159/1981 makes unavoidable -- distinct from its *siblings* too: مادة ١٢٩
+    مكرراً "١" through "٩" are nine separate articles governing one-person
+    companies, and مادة ١٣٥ مكرراً "أ" through "د" four more on company
+    division. So the suffix cannot be a boolean; it has to carry the whole
+    designation, and every way of writing it must fold to the same key:
+
+        "مكرر" / "مكرراً" / "مكررًا"      -> "مكرر"
+        'مكرراً "١"' / "مكرر ١" / "مكرر 1" -> "مكرر 1"
+        'مكرراً "أ"' / "مكرر أ"            -> "مكرر ا"
+
+    A suffix we do not recognise is kept as-is rather than dropped: an
+    unknown designation must never silently match the base article.
+    """
+    if raw is None:
+        return None
+    text = str(raw).translate(_ARABIC_INDIC_DIGITS)
+    text = text.replace("ـ", "")  # tatweel
+    text = _HARAKAT_RE.sub("", text)  # tanween/harakat: مكرراً -> مكررا
+    text = _SUFFIX_PUNCT_RE.sub(" ", text)  # the quotes around "١" / "أ"
+    for ch in "أإآٱ":
+        text = text.replace(ch, "ا")
+    text = text.replace("ى", "ي").replace("ی", "ي").replace("ة", "ه")
+    text = re.sub(rf"{MUKARRAR}ا?", MUKARRAR, text)  # مكررا -> مكرر
+    text = re.sub(r"\s+", " ", text).strip()
+    return text or None
+
+
+def normalize_article_number(raw: str | int) -> tuple[int, str | None]:
     """Parse a (possibly Arabic-Indic) article number, preserving the مكرر distinction.
 
-    Returns (number, is_mukarrar). "163" -> (163, False); "163 مكرر" -> (163, True).
-    مكرر articles are legally distinct from their base article and must never
-    collapse into it.
+    Returns (number, suffix). "163" -> (163, None); "163 مكرر" -> (163, "مكرر");
+    '129 مكرراً "5"' -> (129, "مكرر 5"). مكرر articles are legally distinct from
+    their base article and from each other, and must never collapse together.
+
+    Only a مكرر remainder is read as a suffix -- trailing prose ("11 من هذا
+    القانون") is not a designation and would otherwise fail every lookup.
     """
     if isinstance(raw, int):
-        return raw, False
+        return raw, None
     text = str(raw).translate(_ARABIC_INDIC_DIGITS)
-    is_mukarrar = MUKARRAR in text
     match = re.search(r"\d+", text)
     if not match:
         raise ValueError(f"No article number found in {raw!r}")
-    return int(match.group()), is_mukarrar
+    remainder = text[match.end() :]
+    suffix = normalize_article_suffix(remainder) if MUKARRAR in remainder else None
+    return int(match.group()), suffix
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,7 +97,9 @@ class RetrievedArticle:
     law_number: int
     law_year: int
     article_number: int | None  # None for مواد الإصدار (enacting provisions)
-    article_suffix: str | None  # "مكرر" for a bis article, else None
+    # Full bis designation ("مكرر", "مكرر 1", "مكرر ا"), else None. Not a
+    # boolean: same-number siblings must stay distinct (see normalize_article_suffix).
+    article_suffix: str | None
     article_type: str
     article_status: str
     clean_text: str  # the ONLY text a citation may quote (== body_faithful)
@@ -183,21 +223,23 @@ class Retriever:
         self,
         article_number: int | str,
         law_number: int | None = None,
-        limit: int = 10,
+        limit: int = 50,
     ) -> list[RetrievedArticle]:
         """Exact retrieval by article number, no embedding/ranking involved.
 
         If `law_number` is None and the number exists in more than one law,
         ALL matches are returned -- never silently pick one (cross-law
         disambiguation). Accepts Arabic-Indic digits and preserves the مكرر
-        distinction (163 != 163 مكرر): "163" matches only the base article,
-        "163 مكرر" matches only its bis article. article_suffix is not
-        indexed in Qdrant (at most a couple of points ever share an
-        article_number, so filtering the small result set in Python needs no
-        index), so the distinction is applied after the exact-number scroll
-        below.
+        distinction in full: "163" matches only the base article, "163 مكرر"
+        only its bis article, and '129 مكرراً "5"' only that one sibling --
+        never a different member of the same series. article_suffix is not
+        indexed in Qdrant, so the distinction is applied in Python after the
+        exact-number scroll below; `limit` is what has to be generous enough
+        to survive that filter, since law 159/1981 puts eleven points on
+        article_number 129 alone (base + مكرر + مكرر "١".."٩") before the
+        other three laws contribute their own article 129.
         """
-        number, is_mukarrar = normalize_article_number(article_number)
+        number, suffix = normalize_article_number(article_number)
 
         with observability.start_span(
             name="get_article_by_number",
@@ -223,8 +265,10 @@ class Retriever:
             )
 
             articles = [_to_retrieved_article(r.payload, score=None) for r in records]
-            # A مكرر reference must match only bis points, and a bare number
-            # must match only base points -- never collapse the two.
-            articles = [a for a in articles if (a.article_suffix is not None) == is_mukarrar]
+            # A bis reference must match only that exact designation, and a
+            # bare number only base points -- never collapse a series together.
+            articles = [
+                a for a in articles if normalize_article_suffix(a.article_suffix) == suffix
+            ]
             observability.safe_update(span, output={"result_count": len(articles)})
             return articles

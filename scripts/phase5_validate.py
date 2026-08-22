@@ -139,8 +139,84 @@ def test_mukarrar_citation_contract() -> None:
     )
 
 
+def test_mukarrar_series_are_distinct() -> None:
+    """Two members of one bis series must not verify against each other.
+
+    Law 159/1981 puts eleven separate articles on article_number 129 -- the
+    base, مكرر, and مكرر "١" through "٩" governing one-person companies. While
+    `article_suffix` was a bis *flag*, all ten bis articles shared the citation
+    guard's key, so a citation of «١٢٩ مكررًا "٧"» would verify against a
+    retrieval of «"٢"»: the guard passing an article it never saw, which is the
+    one failure it exists to prevent. Both directions are checked here.
+    """
+    print("\n=== مكرر series (law 159) ===")
+    retriever = Retriever()
+
+    second = retriever.get_article_by_number('129 مكرر 2', law_number=159)
+    seventh = retriever.get_article_by_number('129 مكرر 7', law_number=159)
+    check(
+        "«١٢٩ مكررًا \"٢\"» resolves to exactly one article",
+        len(second) == 1 and second[0].article_suffix == "مكرر ٢",
+        str([(a.chunk_id, a.article_suffix) for a in second]),
+    )
+    check(
+        "«١٢٩ مكررًا \"٧\"» resolves to a DIFFERENT single article",
+        len(seventh) == 1 and seventh[0].chunk_id != second[0].chunk_id,
+        str([(a.chunk_id, a.article_suffix) for a in seventh]),
+    )
+    if not second or not seventh:
+        return
+
+    def answer_for(article) -> dict:
+        return parse_answer_json(
+            _AnswerFormat(
+                answer_text="نص الإجابة",
+                citations=[
+                    _CitationOut(
+                        law_name=article.law_name,
+                        article_number=article.article_number,
+                        article_suffix=article.article_suffix,
+                        citation_label=article.citation_label,
+                    )
+                ],
+            ).model_dump_json()
+        )
+
+    allowed_second = AllowedSet()
+    allowed_second.add_many(second)
+
+    check(
+        "the retrieved sibling verifies through the provider-enforced schema",
+        verify(answer_for(second[0]), allowed_second).is_valid,
+    )
+    check(
+        "a DIFFERENT sibling of the same series is rejected",
+        not verify(answer_for(seventh[0]), allowed_second).is_valid,
+        "this is the false pass the suffix widening closes",
+    )
+
+    lettered = retriever.get_article_by_number('135 مكرر أ', law_number=159)
+    other = retriever.get_article_by_number('135 مكرر ب', law_number=159)
+    allowed_lettered = AllowedSet()
+    allowed_lettered.add_many(lettered)
+    check(
+        "the lettered series behaves the same way (أ retrieved, ب rejected)",
+        bool(lettered) and bool(other)
+        and verify(answer_for(lettered[0]), allowed_lettered).is_valid
+        and not verify(answer_for(other[0]), allowed_lettered).is_valid,
+    )
+
+    repealed = retriever.get_article_by_number(22, law_number=159)
+    check(
+        "a repealed article is retrievable and flagged, not dropped",
+        len(repealed) == 1 and repealed[0].article_status == "repealed",
+        str([(a.chunk_id, a.article_status) for a in repealed]),
+    )
+
+
 async def main() -> None:
     test_mukarrar_citation_contract()
+    test_mukarrar_series_are_distinct()
 
     transport = httpx.ASGITransport(app=app_module.app)
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
@@ -266,6 +342,49 @@ async def main() -> None:
             "an amended article's answer flags that it was amended, and by which law",
             "١٦٠" in answer9 or "160" in answer9,
             f"answer={answer9[:200]!r}",
+        )
+
+        print("\n=== Law 159/1981: bis series through the API ===")
+        conv159 = await client.post(
+            "/conversations", json={"title": "اختبار قانون الشركات"}, headers=headers_a
+        )
+        conv159_id = conv159.json()["id"]
+
+        _, body159 = await post_chat(
+            client,
+            headers_a,
+            conv159_id,
+            'ما نص المادة ١٢٩ مكررًا "٥" من قانون الشركات؟',
+        )
+        events159 = parse_sse(body159)
+        citations159 = next((d for e, d in events159 if e == "citations"), {"citations": []})
+        check(
+            "a law-159 question is answered from the corpus, not refused",
+            "withdrawn" not in [e for e, _ in events159] and bool(citations159["citations"]),
+            str([e for e, _ in events159]),
+        )
+        # The designation has to survive the whole path -- prompt, provider
+        # schema, guard, SSE payload -- carrying which sibling was cited, not
+        # merely that some bis article was.
+        check(
+            "the citation names the exact sibling, not just «مكرر»",
+            any(
+                c["article_number"] == 129
+                and c.get("article_suffix") not in (None, MUKARRAR)
+                and MUKARRAR in c["article_suffix"]
+                for c in citations159["citations"]
+            ),
+            str(citations159),
+        )
+
+        _, body_rep = await post_chat(
+            client, headers_a, conv159_id, "ما نص المادة ٢٢ من قانون الشركات؟"
+        )
+        answer_rep = "".join(d["text"] for e, d in parse_sse(body_rep) if e == "token")
+        check(
+            "a repealed article is reported as repealed, not served as live law",
+            "ملغا" in answer_rep or "ألغيت" in answer_rep or "إلغا" in answer_rep,
+            f"answer={answer_rep[:200]!r}",
         )
 
         print("\n=== User isolation through the API ===")

@@ -1,6 +1,6 @@
 """Canonical Arabic law-identity strings.
 
-There are exactly three ingested laws. Payload carries a bare `law_name`
+There are exactly four ingested laws. Payload carries a bare `law_name`
 (e.g. "القانون المدني") plus `law_number`/`law_year`, but citations must use
 one canonical full-name string consistently everywhere: the context handed
 to the LLM, what the LLM is instructed to cite, and the citation guard's
@@ -23,6 +23,10 @@ _LAW_BASE_NAMES: dict[tuple[int, int], str] = {
     (174, 2025): "قانون الإجراءات الجنائية",
     (131, 1948): "القانون المدني",
     (72, 2017): "قانون الاستثمار",
+    # Officially «قانون شركات المساهمة وشركات التوصية بالأسهم والشركات ذات
+    # المسئولية المحدودة وشركات الشخص الواحد» -- cited universally, including
+    # by its own amending statutes, as قانون الشركات.
+    (159, 1981): "قانون الشركات",
 }
 
 
