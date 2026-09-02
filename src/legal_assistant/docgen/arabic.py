@@ -1,4 +1,3 @@
-# src/legal_assistant/docgen/arabic.py
 """Arabic text helpers for docgen.
 
 Deliberately duplicates ~15 lines of `arabic_ingest/arabic_text.py` rather
