@@ -185,6 +185,13 @@ _SHARE_ROW = re.compile(
 _MAX_NAME_WORDS = 5
 _NAME_ONLY = re.compile(r"^\s*(?P<name>[^\d٠-٩:،.؛\n]{3,})\s*$")
 
+# Blank lines and table-border artifacts (dashes, pipes, dot leaders) are
+# structural noise, not content -- ragged OCR is full of them between real
+# rows. They carry no name, so they can never become a spurious Party;
+# `parse_party_table` skips them rather than treating them as the end of the
+# roster, so a stray blank line does not silently drop every partner after it.
+_BLANK_OR_BORDER = re.compile(r"^[\s\-–—_=|.·•]*$")
+
 
 def parse_party_table(text: str) -> list[Party]:
     """Pull partner/shareholder rows out of a capital article's share table.
@@ -192,10 +199,11 @@ def parse_party_table(text: str) -> list[Party]:
     Returns [] when the article states only aggregates -- which is exactly
     what the blank GAFI مساهمة نموذج does. A name with no parseable holding
     yields a Party with `shares=None`, so the name still prefills and the
-    review screen asks for the number. The roster is a contiguous block: the
-    first line once started that is neither a share row nor a name-shaped
-    line ends it, so trailing prose in the same article is never captured
-    as a spurious partner.
+    review screen asks for the number. The roster is a contiguous block of
+    content: blank lines and border artifacts inside it are skipped (see
+    `_BLANK_OR_BORDER`), but the first real-content line once started that is
+    neither a share row nor a name-shaped line ends it, so trailing prose in
+    the same article is never captured as a spurious partner.
     """
     parties: list[Party] = []
     started = False
@@ -205,6 +213,9 @@ def parse_party_table(text: str) -> list[Party]:
             # The roster begins after the "وزعت على الشركاء كالآتى" style lead-in.
             if re.search(r"(الشركاء|المساهمين|المؤسسين)\s*(كالآتى|كالاتى|كالتالى|:)", line):
                 started = True
+            continue
+
+        if _BLANK_OR_BORDER.match(line):
             continue
 
         row = _SHARE_ROW.match(line)

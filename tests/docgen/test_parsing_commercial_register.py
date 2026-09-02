@@ -153,3 +153,27 @@ def test_parse_party_table_stops_at_trailing_prose():
     )
     parties = parse_party_table(text)
     assert [p.name for p in parties] == ["مايكل فوزى", "مايكل مجدى"]
+
+
+def test_parse_party_table_skips_a_blank_line_inside_the_roster():
+    # A stray blank line is ordinary in ragged OCR output; it must not
+    # silently truncate the roster.
+    text = (
+        "وزعت على الشركاء كالآتى:\n"
+        "مايكل فوزى ٩٠ حصة ٩٠٪\n"
+        "\n"
+        "مايكل مجدى ١٠ حصة ١٠٪\n"
+    )
+    parties = parse_party_table(text)
+    assert [p.name for p in parties] == ["مايكل فوزى", "مايكل مجدى"]
+
+
+def test_parse_party_table_skips_a_whitespace_only_line_inside_the_roster():
+    text = (
+        "وزعت على الشركاء كالآتى:\n"
+        "مايكل فوزى ٩٠ حصة ٩٠٪\n"
+        "   \t  \n"
+        "مايكل مجدى ١٠ حصة ١٠٪\n"
+    )
+    parties = parse_party_table(text)
+    assert [p.name for p in parties] == ["مايكل فوزى", "مايكل مجدى"]
