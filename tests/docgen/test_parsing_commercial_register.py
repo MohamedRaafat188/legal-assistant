@@ -127,3 +127,29 @@ def test_parse_party_table_never_invents_a_split():
     parties = parse_party_table(text)
     assert [p.name for p in parties] == ["مايكل فوزى", "مايكل مجدى"]
     assert all(p.shares is None and p.percentage is None for p in parties)
+
+
+def test_parse_party_table_keeps_a_row_missing_its_percentage():
+    # Shares stated, percentage not -- degrade to None, don't drop the partner
+    # and don't derive the missing half.
+    text = "وزعت على الشركاء كالآتى:\nمايكل فوزى ٩٠ حصة\n"
+    parties = parse_party_table(text)
+    assert parties == [Party(name="مايكل فوزى", shares="٩٠", percentage=None)]
+
+
+def test_parse_party_table_keeps_a_row_missing_its_share_count():
+    # Percentage stated, share count not -- mirror case, same rule.
+    text = "وزعت على الشركاء كالآتى:\nمايكل فوزى ٩٠٪\n"
+    parties = parse_party_table(text)
+    assert parties == [Party(name="مايكل فوزى", shares=None, percentage="٩٠")]
+
+
+def test_parse_party_table_stops_at_trailing_prose():
+    text = (
+        "وزعت على الشركاء كالآتى:\n"
+        "مايكل فوزى ٩٠ حصة ٩٠٪\n"
+        "مايكل مجدى ١٠ حصة ١٠٪\n"
+        "ويلتزم كل شريك بنسبة حصته فى الأرباح والخسائر.\n"
+    )
+    parties = parse_party_table(text)
+    assert [p.name for p in parties] == ["مايكل فوزى", "مايكل مجدى"]

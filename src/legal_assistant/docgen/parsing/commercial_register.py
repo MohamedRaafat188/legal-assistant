@@ -168,15 +168,22 @@ def split_capital(text: str) -> tuple[str | None, str | None]:
     return (None, single.group(1) if single else None)
 
 
-# A share row is: a name, then a share count, then a percentage. Digits in
-# either set; the percentage sign may be ٪ or %. Anything that does not match
-# this shape contributes a name-only Party rather than a guessed holding.
+# A share row is: a name, then optionally a share count, then optionally a
+# percentage -- at least one of the two numbers must be present. Digits in
+# either set; the percentage sign may be ٪ or %. A row missing one half
+# degrades to that field being None (the lawyer fills it in at review); a
+# row with neither number is not a share row at all and falls through to
+# `_NAME_ONLY` instead.
 _SHARE_ROW = re.compile(
     r"^\s*(?P<name>[^\d٠-٩\n]{3,})?\s*"
-    r"(?P<shares>[0-9٠-٩]+)\s*(?:حصة|حصص|سهم|سهما|أسهم)\s*"
-    r"(?P<pct>[0-9٠-٩]+(?:[.,][0-9٠-٩]+)?)\s*[٪%]"
+    r"(?:(?P<shares>[0-9٠-٩]+)\s*(?:حصة|حصص|سهم|سهما|أسهم))?\s*"
+    r"(?:(?P<pct>[0-9٠-٩]+(?:[.,][0-9٠-٩]+)?)\s*[٪%])?\s*$"
 )
-_NAME_ONLY = re.compile(r"^\s*(?P<name>[^\d٠-٩:،\n]{3,})\s*$")
+
+# Partner names in these documents run 2-5 words; a longer line is prose, not
+# a name, and ends the roster (see `parse_party_table`).
+_MAX_NAME_WORDS = 5
+_NAME_ONLY = re.compile(r"^\s*(?P<name>[^\d٠-٩:،.؛\n]{3,})\s*$")
 
 
 def parse_party_table(text: str) -> list[Party]:
@@ -185,7 +192,10 @@ def parse_party_table(text: str) -> list[Party]:
     Returns [] when the article states only aggregates -- which is exactly
     what the blank GAFI مساهمة نموذج does. A name with no parseable holding
     yields a Party with `shares=None`, so the name still prefills and the
-    review screen asks for the number.
+    review screen asks for the number. The roster is a contiguous block: the
+    first line once started that is neither a share row nor a name-shaped
+    line ends it, so trailing prose in the same article is never captured
+    as a spurious partner.
     """
     parties: list[Party] = []
     started = False
@@ -198,7 +208,7 @@ def parse_party_table(text: str) -> list[Party]:
             continue
 
         row = _SHARE_ROW.match(line)
-        if row and row.group("name"):
+        if row and row.group("name") and (row.group("shares") or row.group("pct")):
             parties.append(
                 Party(
                     name=row.group("name").strip(),
@@ -209,7 +219,11 @@ def parse_party_table(text: str) -> list[Party]:
             continue
 
         name_only = _NAME_ONLY.match(line)
-        if name_only:
+        if name_only and len(name_only.group("name").split()) <= _MAX_NAME_WORDS:
             parties.append(Party(name=name_only.group("name").strip()))
+            continue
+
+        # Neither shape matched -- the roster block has ended.
+        break
 
     return parties
