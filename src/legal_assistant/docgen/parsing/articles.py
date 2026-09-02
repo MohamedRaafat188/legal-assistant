@@ -48,14 +48,16 @@ def segment_articles(text: str) -> list[ExtractedArticle]:
     entry rather than failing.
     """
     matches = list(ARTICLE_HEADING.finditer(text))
+    kept: list[tuple[re.Match[str], int]] = []
+    for match in matches:
+        number = parse_article_number(match.group(1))
+        if number is not None:
+            kept.append((match, number))
     articles: list[ExtractedArticle] = []
 
-    for index, match in enumerate(matches):
-        number = parse_article_number(match.group(1))
-        if number is None:
-            continue
+    for index, (match, number) in enumerate(kept):
         body_start = match.end()
-        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        end = kept[index + 1][0].start() if index + 1 < len(kept) else len(text)
         articles.append(
             ExtractedArticle(
                 number=number,

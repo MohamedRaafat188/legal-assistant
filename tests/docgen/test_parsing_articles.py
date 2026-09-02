@@ -1,3 +1,4 @@
+from legal_assistant.docgen.parsing import articles
 from legal_assistant.docgen.parsing.articles import segment_articles
 
 
@@ -51,3 +52,48 @@ def test_masahma_namuzag_yields_a_restarting_sequence(masahma_text):
     assert numbers, "the نموذج must yield articles"
     # Two instruments in one file -> the numbering restarts at least once.
     assert any(b <= a for a, b in zip(numbers, numbers[1:], strict=False))
+
+
+def test_a_skipped_headings_body_merges_into_the_preceding_article(monkeypatch):
+    # parse_article_number cannot actually return None through the public
+    # regex (its capture group is digits-only), so this drives the branch
+    # directly to prove a skipped heading's text is merged, not dropped.
+    real_parse = articles.parse_article_number
+
+    def fake_parse(text: str) -> int | None:
+        if text == "2":
+            return None
+        return real_parse(text)
+
+    monkeypatch.setattr(articles, "parse_article_number", fake_parse)
+
+    text = (
+        "مادة (1)\n"
+        "بند أول.\n"
+        "مادة (2)\n"
+        "بند مخفى لا يجوز أن يضيع.\n"
+        "مادة (3)\n"
+        "بند ثالث."
+    )
+
+    result = articles.segment_articles(text)
+
+    assert [a.number for a in result] == [1, 3]
+    assert "بند مخفى لا يجوز أن يضيع" in result[0].body
+    # No character of the input is lost: the kept spans are contiguous and
+    # together cover the whole text (there is no preamble here).
+    assert result[0].start == 0
+    assert result[0].end == result[1].start
+    assert result[1].end == len(text)
+
+
+def test_a_midsentence_cross_reference_does_not_start_a_new_article():
+    text = (
+        "مادة (1)\n"
+        "يجوز للشركة ممارسة أي نشاط آخر وذلك طبقا لأحكام المادة (٣) المنصوص "
+        "عليها فى القانون.\n"
+        "مادة (2)\n"
+        "نص المادة الثانية."
+    )
+
+    assert [a.number for a in segment_articles(text)] == [1, 2]
