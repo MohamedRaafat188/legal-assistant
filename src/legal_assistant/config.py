@@ -69,6 +69,20 @@ class Settings(BaseSettings):
     langfuse_secret_key: str | None = None
     langfuse_base_url: str = "https://cloud.langfuse.com"
 
+    # docgen (قرار/محضر التعديل generation). OCR is cloud-only by design --
+    # `ocr_provider` exists so the provider can be swapped without touching
+    # callers, not so a local model can be plugged in.
+    ocr_provider: str = "gemini"
+    ocr_model: str = "gemini-3-pro"
+    # Two-pass OCR: a cheap low-DPI pass classifies every page, then only the
+    # contract-body pages are re-rendered at full fidelity and transcribed.
+    docgen_classify_dpi: int = 80
+    docgen_ocr_dpi: int = 220
+    # Uploaded عقود carry national ID and passport numbers, so they live
+    # outside the DB under a non-guessable key and are purged on expiry.
+    docgen_storage_dir: str = "var/docgen"
+    docgen_retention_days: int = 2
+
 
 def get_settings() -> Settings:
     """Return a freshly loaded Settings instance."""
