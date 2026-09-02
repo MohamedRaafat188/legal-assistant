@@ -93,7 +93,7 @@ _SPECS: dict[CompanyType, TemplateSpec] = {
     CompanyType.ZMM: TemplateSpec(
         company_type=CompanyType.ZMM,
         path=FILES / "محضر_تعديل_شركة_ذات_مسئولية_محدودة_template.docx",
-        scalar_placeholders=_COMMON_SCALARS | _MEETING_SCALARS,
+        scalar_placeholders=_COMMON_SCALARS | _MEETING_SCALARS | {"company_address"},
         article_placeholders=_ARTICLE_FIELDS,
         attendee_placeholders=_ATTENDEE_FIELDS,
         attendee_label="partner",
@@ -104,6 +104,7 @@ _SPECS: dict[CompanyType, TemplateSpec] = {
         scalar_placeholders=_COMMON_SCALARS
         | _MEETING_SCALARS
         | {
+            "company_address",
             "secretary_name",
             "vote_collector_name",
             "gafi_representative_name",
@@ -130,11 +131,25 @@ def get_template(company_type: str) -> TemplateSpec:
     raise KeyError(f"unknown company type: {company_type}")
 
 
+_SCANNED_PART = re.compile(r"word/(document|header\d*|footer\d*)\.xml")
+
+
 def placeholders_in(path: pathlib.Path) -> set[str]:
-    """Every `{{ name }}` variable in a .docx, dotted names included."""
+    """Every `{{ name }}` variable in a .docx, dotted names included.
+
+    Scans the document body plus every header/footer part -- default,
+    first-page, and even-page variants alike, tables nested inside them
+    included -- since OOXML stores each as its own `word/header*.xml` /
+    `word/footer*.xml` part regardless of which python-docx property
+    exposes it. A scanner limited to `word/document.xml` is blind to a
+    stray token left in a header or footer.
+    """
+    found: set[str] = set()
     with zipfile.ZipFile(path) as archive:
-        xml = archive.read("word/document.xml").decode("utf-8")
-    return set(_VAR.findall(xml))
+        for name in archive.namelist():
+            if _SCANNED_PART.fullmatch(name):
+                found.update(_VAR.findall(archive.read(name).decode("utf-8")))
+    return found
 
 
 def verify_all() -> None:

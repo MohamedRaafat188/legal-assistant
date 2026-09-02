@@ -38,20 +38,50 @@ _TOKEN = re.compile(r"\{\{.*?\}\}|\{%.*?%\}", re.DOTALL)
 _EXPECTED = {
     "shakhs_wahed": (19, [], "b123ece71fbfcca16c692ebe8dfe45325f0c7a25825b101dd9ad06440b7afd54"),
     "zmm": (
-        16,
+        17,
         [(4, 4), (1, 2)],
         "700ed61a5ba9ba986d30e32c642ec66426ea060be6b4769af476bed3e2431d0f",
     ),
     "masahma": (
-        22,
+        23,
         [(4, 4), (1, 3)],
         "e9ed04060e3d31bb504884a33652d753c5997cb5c67a8d5e30045b045e66ee0b",
     ),
 }
 
 
+def _header_footer_parts(document):
+    """Every distinct header/footer object on a document's sections.
+
+    Mirrors `render.document_text`'s helper of the same purpose: covers the
+    default, first-page, and even-page variants, skipping any variant that
+    is merely linked to the previous section (i.e. not actually defined) so
+    its inherited-empty text is not double-counted.
+    """
+    parts = []
+    for section in document.sections:
+        for attr in (
+            "header",
+            "footer",
+            "first_page_header",
+            "first_page_footer",
+            "even_page_header",
+            "even_page_footer",
+        ):
+            part = getattr(section, attr)
+            if not part.is_linked_to_previous:
+                parts.append(part)
+    return parts
+
+
 def _measure(path):
-    """(non_empty_paragraph_count, [(rows, cols), ...], sha256_hex_digest) for a .docx."""
+    """(non_empty_paragraph_count, [(rows, cols), ...], sha256_hex_digest) for a .docx.
+
+    Counts and hashes headers/footers along with the body, so a hand-edit
+    that silently drops or alters boilerplate text sitting in a footer (as
+    once shipped verbatim in the zmm/masahma templates -- see task-10
+    review finding 3) is caught by this guard too.
+    """
     document = docx.Document(str(path))
     paragraph_texts = [p.text for p in document.paragraphs if p.text.strip()]
 
@@ -63,6 +93,18 @@ def _measure(path):
             for cell in row.cells:
                 if cell.text.strip():
                     strings.append(cell.text)
+
+    for hf in _header_footer_parts(document):
+        for p in hf.paragraphs:
+            if p.text.strip():
+                paragraph_texts.append(p.text)
+                strings.append(p.text)
+        for table in hf.tables:
+            shapes.append((len(table.rows), len(table.columns)))
+            for row in table.rows:
+                for cell in row.cells:
+                    if cell.text.strip():
+                        strings.append(cell.text)
 
     cleaned = [_TOKEN.sub("", s) for s in strings]
     digest = hashlib.sha256("".join(cleaned).encode("utf-8")).hexdigest()

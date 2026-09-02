@@ -33,6 +33,21 @@ def test_shakhs_wahed_declares_owner_and_address_but_no_attendees():
     assert spec.attendee_label is None
 
 
+def test_zmm_and_masahma_also_declare_company_address():
+    # The company_address token lives in these templates' footer, so the
+    # contract must declare it even though it never appears in the body.
+    assert "company_address" in get_template("zmm").scalar_placeholders
+    assert "company_address" in get_template("masahma").scalar_placeholders
+
+
+def test_placeholders_in_sees_the_footer_token():
+    # company_address for zmm/masahma lives only in the footer; a
+    # placeholder scanner blind to headers/footers would never find it.
+    for company_type in ("zmm", "masahma"):
+        found = placeholders_in(get_template(company_type).path)
+        assert "company_address" in found
+
+
 def test_zmm_declares_partner_attendees():
     spec = get_template("zmm")
     assert spec.attendee_label == "partner"

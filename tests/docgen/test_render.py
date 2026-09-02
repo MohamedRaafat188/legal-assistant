@@ -37,6 +37,7 @@ ZMM_SCALARS = {
     "chairman_name": "مايكل فوزى",
     "attendance_percentage": "100",
     "approval_percentage": "100",
+    "company_address": "٤٠ شارع الهرم، الجيزة",
 }
 
 
@@ -148,3 +149,74 @@ def test_build_context_requires_at_least_one_article():
             article_numbers=[],
             attendees=[],
         )
+
+
+def test_render_document_fails_closed_on_missing_articles_even_bypassing_build_context():
+    # render_document is a documented public entry point in its own right;
+    # a caller must not be able to skip build_context's article check by
+    # constructing the context directly with an empty/missing articles list.
+    # articles_title is filled in deliberately so the only gap under test
+    # is the empty articles list itself, not an unrelated scalar.
+    context = {
+        **SHAKHS_WAHED_SCALARS,
+        "articles_title": "المادة السادسة",
+        "articles": [],
+        "attendees": [],
+    }
+    with pytest.raises(MissingContextError) as excinfo:
+        render_document("shakhs_wahed", context)
+    assert excinfo.value.missing == {"articles"}
+
+
+def test_render_document_fails_closed_when_articles_key_is_absent():
+    context = {
+        **SHAKHS_WAHED_SCALARS,
+        "articles_title": "المادة السادسة",
+        "attendees": [],
+    }
+    with pytest.raises(MissingContextError) as excinfo:
+        render_document("shakhs_wahed", context)
+    assert excinfo.value.missing == {"articles"}
+
+
+def test_render_document_fails_closed_on_missing_attendees_for_zmm():
+    context = build_context(
+        "zmm",
+        scalars=ZMM_SCALARS,
+        articles=_articles()[:1],
+        article_numbers=[6],
+        attendees=[],
+    )
+    with pytest.raises(MissingContextError) as excinfo:
+        render_document("zmm", context)
+    assert excinfo.value.missing == {"attendees"}
+
+
+def test_render_document_does_not_require_attendees_for_shakhs_wahed():
+    # شخص واحد declares no attendee_placeholders at all, so an empty
+    # attendees list must not be treated as a missing value for it.
+    context = build_context(
+        "shakhs_wahed",
+        scalars=SHAKHS_WAHED_SCALARS,
+        articles=_articles()[:1],
+        article_numbers=[6],
+        attendees=[],
+    )
+    text = document_text(render_document("shakhs_wahed", context))
+    assert "{{" not in text and "{%" not in text
+
+
+def test_render_zmm_puts_company_address_in_the_footer_with_no_stray_braces():
+    attendees = [Attendee("مايكل فوزى", "١٠٠", "١٠٠")]
+    context = build_context(
+        "zmm",
+        scalars=ZMM_SCALARS,
+        articles=_articles()[:1],
+        article_numbers=[6],
+        attendees=attendees,
+    )
+    rendered = render_document("zmm", context)
+    text = document_text(rendered)
+    assert "٤٠ شارع الهرم، الجيزة" in text
+    assert "{company_address}" not in text
+    assert "{{" not in text and "{%" not in text
