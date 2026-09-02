@@ -22,3 +22,9 @@ arabic_ingest/law159_intermediates/
 # Local tooling state and Cygwin/MSYS crash dumps
 .claude/
 *.stackdump
+
+# Subagent-driven-development scratch (ledger, briefs, review packages)
+.superpowers/
+
+# docgen uploaded documents (national ID / passport data, purged after 2 days)
+var/
