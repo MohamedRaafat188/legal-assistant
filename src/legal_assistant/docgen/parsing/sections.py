@@ -16,7 +16,7 @@ from legal_assistant.docgen.arabic import normalize_for_match
 from legal_assistant.docgen.parsing.articles import ExtractedArticle, segment_articles
 
 
-class Instrument(str, enum.Enum):  # noqa: UP042 -- matches db.models.MessageRole's style
+class Instrument(enum.StrEnum):
     PRELIMINARY = "preliminary"
     ARTICLES_OF_ASSOCIATION = "articles_of_association"
 
@@ -49,6 +49,15 @@ _PRELIMINARY_TITLES = (
 )
 
 
+# How far into the tail of the preceding article's body to look for a title.
+# `ExtractedArticle.end` is the start of the *next kept heading*, so a new
+# group's first heading immediately follows the previous group's last
+# article -- there is no gap between them. A mid-document title therefore
+# does not sit in the gap; it got swallowed into the tail of that previous
+# article's `body`, because `body` runs all the way to the next heading.
+_TITLE_TAIL_CHARS = 300
+
+
 def _looks_preliminary(text: str) -> bool:
     normalized = normalize_for_match(text)
     return any(normalize_for_match(t) in normalized for t in _PRELIMINARY_TITLES)
@@ -59,10 +68,16 @@ def split_instruments(text: str) -> list[Section]:
 
     A new instrument starts wherever the article number fails to increase --
     the restart is the only signal present in every sample, since the titles
-    are OCR-fragile. The heading text before each group then decides which
-    instrument it is: a group titled العقد الابتدائي is PRELIMINARY, and
-    everything else (including a single-instrument document) is the
-    ARTICLES_OF_ASSOCIATION.
+    are OCR-fragile. Whichever text precedes each group then decides which
+    instrument it is: a group preceded by a title reading العقد الابتدائي is
+    PRELIMINARY, and everything else (including a single-instrument
+    document) is the ARTICLES_OF_ASSOCIATION. For the first group, that text
+    is whatever precedes the first heading in the whole document. For every
+    later group, the title lives at the end of the previous group's last
+    article's body (see `_TITLE_TAIL_CHARS`), since `ExtractedArticle.end`
+    is defined as the start of the next kept heading -- there is no gap
+    between one group's last article and the next group's first heading for
+    a title to occupy on its own.
     """
     articles = segment_articles(text)
     if not articles:
@@ -77,10 +92,11 @@ def split_instruments(text: str) -> list[Section]:
 
     sections: list[Section] = []
     for index, group in enumerate(groups):
-        # Look at the text between the previous group's end and this group's
-        # first heading -- that is where a document title sits.
-        title_start = 0 if index == 0 else groups[index - 1][-1].end
-        title_region = text[title_start : group[0].start]
+        if index == 0:
+            title_region = text[: group[0].start]
+        else:
+            preceding_body = groups[index - 1][-1].body
+            title_region = preceding_body[-_TITLE_TAIL_CHARS:]
         instrument = (
             Instrument.PRELIMINARY
             if _looks_preliminary(title_region)
@@ -107,7 +123,19 @@ def select_target(
             "لم يتم العثور على النظام الأساسى للشركة داخل الملف المرفوع. "
             "راجع الملف أو أدخل نص المواد يدويا."
         )
-    # A document can only have one of each series; if OCR noise produced
-    # several, the last one is the operative instrument (the نموذج puts the
-    # النظام الأساسي after the العقد الابتدائي).
+    if len(matching) > 1:
+        # OCR noise (a misread digit, a duplicated heading) can produce a
+        # spurious article-number restart *inside* the target series, which
+        # splits it into two groups with no title between them to tell them
+        # apart. Do not guess which fragment is correct or merge them --
+        # that is guesswork about legal text. Use the last one (the نموذج's
+        # ordering puts the operative instrument last) but say so, so a
+        # dropped fragment of amendable articles is never silent.
+        return matching[-1].articles, (
+            f"تم العثور على {len(matching)} أقسام يبدو أنها تنتمي إلى النظام الأساسى "
+            "للشركة داخل الملف المرفوع بدلا من قسم واحد. تم استخدام آخر قسم؛ "
+            "يرجى مراجعة الملف للتأكد من عدم فقدان مواد."
+        )
+    # A document can only have one of each series; this is the ordinary,
+    # unambiguous case.
     return matching[-1].articles, None

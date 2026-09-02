@@ -33,6 +33,29 @@ def test_number_restart_starts_a_new_section():
     assert [a.number for a in sections[1].articles] == [1, 2, 3]
 
 
+def test_mid_document_title_is_read_from_the_preceding_articles_body():
+    # A mid-document title does not sit in a gap between groups --
+    # `ExtractedArticle.end` is defined as the next kept heading's start, so
+    # the previous group's last article immediately abuts the next group's
+    # first heading. The title text is swallowed into the tail of that
+    # previous article's body instead. Here the second group is the one
+    # titled العقد الابتدائي, to prove the tail-of-body path (not just the
+    # index-0 path) actually classifies it.
+    text = (
+        "مادة (١)\nبند تمهيدي.\n"
+        "مادة (٢)\nبند آخر.\n"
+        "العقد الابتدائى\n"
+        "مادة (١)\nاسم الشركة.\n"
+        "مادة (٢)\nغرض الشركة.\n"
+    )
+    sections = split_instruments(text)
+    assert [s.instrument for s in sections] == [
+        Instrument.ARTICLES_OF_ASSOCIATION,
+        Instrument.PRELIMINARY,
+    ]
+    assert [a.number for a in sections[1].articles] == [1, 2]
+
+
 def test_masahma_namuzag_splits_into_two_instruments(masahma_text):
     sections = split_instruments(masahma_text)
     assert len(sections) >= 2
@@ -61,6 +84,32 @@ def test_select_target_warns_instead_of_guessing_when_the_series_is_missing():
     assert articles == []
     assert warning is not None
     assert "النظام الأساسى" in warning
+
+
+def test_select_target_warns_when_multiple_sections_match_the_wanted_instrument():
+    # A spurious restart inside the target series (misread digit, duplicated
+    # heading) can split it into two groups with no title between them to
+    # tell them apart -- both legitimately classify as
+    # ARTICLES_OF_ASSOCIATION. select_target must not silently drop the
+    # earlier fragment; it returns the last group's articles but says so.
+    text = (
+        "العقد الابتدائى\n"
+        "مادة (١)\nاسم الشركة.\n"
+        "النظام الأساسى\n"
+        "مادة (١)\nالتأسيس.\n"
+        "مادة (٢)\nالاسم.\n"
+        "مادة (١)\nإعادة بسبب خطأ ماسح ضوئي.\n"
+        "مادة (٢)\nمادة أخرى.\n"
+    )
+    sections = split_instruments(text)
+    assert [s.instrument for s in sections] == [
+        Instrument.PRELIMINARY,
+        Instrument.ARTICLES_OF_ASSOCIATION,
+        Instrument.ARTICLES_OF_ASSOCIATION,
+    ]
+    articles, warning = select_target(sections, "masahma")
+    assert articles is sections[-1].articles
+    assert warning is not None
 
 
 def test_select_target_rejects_an_unknown_company_type(zmm_text):
