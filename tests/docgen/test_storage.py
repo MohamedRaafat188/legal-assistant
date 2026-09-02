@@ -90,3 +90,54 @@ def test_symlink_escape_is_rejected(storage_root, tmp_path_factory):
 def test_new_key_values_are_not_sequential_or_derived_from_session_id():
     keys = {storage.new_key(1, "aoa") for _ in range(20)}
     assert len(keys) == 20  # no collisions, no predictable counter
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "NUL",
+        "nul",
+        "Nul",
+        "NUL.txt",
+        "CON",
+        "con",
+        "PRN",
+        "AUX",
+        "COM1",
+        "com9",
+        "LPT1",
+        "lpt9",
+        "7/NUL",
+        "7/nul.txt",
+        "7/COM1",
+    ],
+)
+def test_reserved_windows_device_names_are_rejected(key):
+    """A bare or nested reserved device name must never reach the OS's
+    filesystem layer -- on Windows, <anything>\\NUL silently discards
+    writes and reads back empty, which is silent data loss, not a miss."""
+    with pytest.raises(storage.StorageKeyError):
+        storage.read(key)
+    with pytest.raises(storage.StorageKeyError):
+        storage.write(key, b"x")
+
+
+@pytest.mark.parametrize("key", [".", "", "7", "7/"])
+def test_keys_naming_a_directory_raise_storage_key_error_not_permission_error(key, storage_root):
+    """`.`, `""`, and any key naming an existing session directory (with or
+    without a trailing separator) resolve inside the root and so pass the
+    traversal guard, but are not a regular file. These must surface as
+    StorageKeyError, not a raw PermissionError leaking an absolute host path."""
+    (storage_root / "7").mkdir(parents=True, exist_ok=True)
+    with pytest.raises(storage.StorageKeyError) as excinfo:
+        storage.read(key)
+    assert str(storage_root) not in str(excinfo.value)
+
+
+def test_storage_key_error_never_embeds_the_absolute_storage_root(storage_root):
+    """StorageKeyError messages are eventually surfaced to an API client, so
+    they must never leak the absolute host filesystem path of the storage
+    root, even for the traversal-rejection cases."""
+    with pytest.raises(storage.StorageKeyError) as excinfo:
+        storage.read("../escape")
+    assert str(storage_root) not in str(excinfo.value)
