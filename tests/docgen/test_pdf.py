@@ -47,9 +47,18 @@ def test_render_pages_honours_a_page_subset(three_page_pdf):
     assert [i.page for i in images] == [2]
 
 
-def test_render_pages_ignores_out_of_range_page_numbers(three_page_pdf):
-    images = render_pages(three_page_pdf, dpi=72, pages=[1, 99])
-    assert [i.page for i in images] == [1]
+def test_render_pages_rejects_out_of_range_page_numbers(three_page_pdf):
+    """An out-of-range page index must raise, not silently drop the page --
+    Task 14 feeds render_pages output straight to a vision model, so a
+    silently-shrunk result would look like a document with fewer pages than
+    it actually has."""
+    with pytest.raises(InvalidPdfError, match="99"):
+        render_pages(three_page_pdf, dpi=72, pages=[1, 99])
+
+
+def test_render_pages_error_names_the_actual_page_count(three_page_pdf):
+    with pytest.raises(InvalidPdfError, match="3"):
+        render_pages(three_page_pdf, dpi=72, pages=[99])
 
 
 def test_higher_dpi_produces_a_bigger_image(three_page_pdf):
@@ -96,9 +105,43 @@ def test_non_positive_dpi_is_rejected(three_page_pdf, dpi):
         render_pages(three_page_pdf, dpi=dpi, pages=[1])
 
 
-def test_negative_page_numbers_are_skipped_not_crashed(three_page_pdf):
-    images = render_pages(three_page_pdf, dpi=72, pages=[-1, 0, 2])
-    assert [i.page for i in images] == [2]
+def test_negative_page_numbers_are_rejected_not_silently_dropped(three_page_pdf):
+    with pytest.raises(InvalidPdfError, match="-1"):
+        render_pages(three_page_pdf, dpi=72, pages=[-1, 0, 2])
+
+
+def test_zero_page_index_is_rejected(three_page_pdf):
+    with pytest.raises(InvalidPdfError, match="0"):
+        render_pages(three_page_pdf, dpi=72, pages=[0, 2])
+
+
+def test_empty_pages_list_is_rejected_as_a_caller_bug(three_page_pdf):
+    """An explicit request for zero pages is a caller bug, not a valid
+    request -- pages=None (all pages) is the correct way to ask for
+    everything."""
+    with pytest.raises(InvalidPdfError):
+        render_pages(three_page_pdf, dpi=72, pages=[])
+
+
+def test_duplicate_page_indices_are_rejected(three_page_pdf):
+    """A caller asking for the same page twice gets an explicit error, not
+    a result silently deduplicated (or silently doubled) behind their back."""
+    with pytest.raises(InvalidPdfError, match="2"):
+        render_pages(three_page_pdf, dpi=72, pages=[2, 2])
+
+
+def test_pages_none_still_renders_every_page(three_page_pdf):
+    images = render_pages(three_page_pdf, dpi=72, pages=None)
+    assert [i.page for i in images] == [1, 2, 3]
+
+
+def test_render_pages_error_messages_contain_no_filesystem_paths(three_page_pdf):
+    for bad_pages in ([99], [-3], [0, 99], []):
+        with pytest.raises(InvalidPdfError) as excinfo:
+            render_pages(three_page_pdf, dpi=72, pages=bad_pages)
+        message = str(excinfo.value)
+        assert "\\" not in message
+        assert "/" not in message
 
 
 def test_zero_page_document_reports_zero_and_renders_nothing(monkeypatch):

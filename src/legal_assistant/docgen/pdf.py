@@ -73,24 +73,55 @@ def page_count(pdf_bytes: bytes) -> int:
             raise InvalidPdfError(f"could not read the PDF's page count: {e}") from e
 
 
+def _check_pages(pages: Sequence[int], page_count_: int) -> None:
+    """Reject any page request that would otherwise silently shrink the
+    result -- an out-of-range/zero/negative index, an empty request, or a
+    duplicate index. Task 14 feeds render_pages output straight to a vision
+    model, so a caller asking for page 99 must get a hard failure, not a
+    document that quietly appears to have fewer pages than it does.
+    """
+    if len(pages) == 0:
+        raise InvalidPdfError("pages must not be empty; omit `pages` to render all pages")
+    seen: set[int] = set()
+    for number in pages:
+        if not 1 <= number <= page_count_:
+            raise InvalidPdfError(
+                f"page {number} is out of range for a document with {page_count_} page(s)"
+            )
+        if number in seen:
+            raise InvalidPdfError(f"page {number} was requested more than once")
+        seen.add(number)
+
+
 def render_pages(
     pdf_bytes: bytes, dpi: int, pages: Sequence[int] | None = None
 ) -> list[PageImage]:
     """Render `pages` (1-based; all pages when None) to PNG at `dpi`.
 
-    Page numbers outside the document (including negative or zero) are
-    skipped rather than raising -- a stale classification referring to a
-    page that no longer exists should degrade, not crash the job. A
-    zero-page document simply yields an empty list.
+    Every page number in `pages` must be in range (1..page_count), unique,
+    and `pages` itself must not be empty -- any violation raises
+    InvalidPdfError naming the offending index and the document's actual
+    page count, rather than silently returning a shorter list than asked
+    for. Pass `pages=None` to render every page (including a genuinely
+    zero-page document, which yields an empty list).
     """
     _check_dpi(dpi)
     with _open(pdf_bytes) as document:
         try:
-            wanted = list(pages) if pages is not None else range(1, document.page_count + 1)
+            total_pages = document.page_count
+        except _PYMUPDF_ERRORS as e:
+            raise InvalidPdfError(f"could not read the PDF's page count: {e}") from e
+        # Outside any try/except _PYMUPDF_ERRORS: InvalidPdfError is itself a
+        # ValueError, one of the _PYMUPDF_ERRORS types, so raising it from
+        # inside such a block would get it re-wrapped with the wrong message.
+        if pages is not None:
+            wanted = list(pages)
+            _check_pages(wanted, total_pages)
+        else:
+            wanted = list(range(1, total_pages + 1))
+        try:
             images: list[PageImage] = []
             for number in wanted:
-                if not 1 <= number <= document.page_count:
-                    continue
                 pixmap = document.load_page(number - 1).get_pixmap(dpi=dpi)
                 images.append(PageImage(page=number, png=pixmap.tobytes("png")))
             return images
