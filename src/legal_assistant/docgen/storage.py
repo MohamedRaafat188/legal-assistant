@@ -101,15 +101,34 @@ def write(key: str, data: bytes) -> None:
     path = _resolve(key)
     if path.exists() and not path.is_file():
         raise StorageKeyError(f"storage key does not name a file: {key!r}")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(data)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+    except OSError as e:
+        # e.g. a path component collides with an existing non-directory file,
+        # or the target is unwritable -- str(e) from the OS carries the
+        # absolute path, which must never reach a client. Only the
+        # caller-supplied key (never absolute, by construction of _resolve)
+        # goes in the message here.
+        raise StorageKeyError(f"storage key could not be written: {key!r}") from e
 
 
 def read(key: str) -> bytes:
     path = _resolve(key)
     if path.exists() and not path.is_file():
         raise StorageKeyError(f"storage key does not name a file: {key!r}")
-    return path.read_bytes()
+    try:
+        return path.read_bytes()
+    except FileNotFoundError as e:
+        # A well-formed key naming no stored file is a *different* case from
+        # an invalid/hostile key (StorageKeyError, raised above and in
+        # _resolve): callers need to tell "no such upload" from "this key is
+        # malformed" apart. Kept as FileNotFoundError -- the type existing
+        # callers (and the pre-existing test suite) already expect -- but
+        # with the absolute path scrubbed from the message.
+        raise FileNotFoundError(f"no stored file for key: {key!r}") from e
+    except OSError as e:
+        raise StorageKeyError(f"storage key could not be read: {key!r}") from e
 
 
 def delete_session(session_id: int) -> int:
@@ -117,6 +136,9 @@ def delete_session(session_id: int) -> int:
     directory = _resolve(str(session_id))
     if not directory.is_dir():
         return 0
-    count = sum(1 for p in directory.rglob("*") if p.is_file())
-    shutil.rmtree(directory)
+    try:
+        count = sum(1 for p in directory.rglob("*") if p.is_file())
+        shutil.rmtree(directory)
+    except OSError as e:
+        raise StorageKeyError(f"could not delete session {session_id!r}") from e
     return count

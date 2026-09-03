@@ -1,3 +1,5 @@
+import pathlib
+
 import pytest
 
 from legal_assistant.docgen import storage
@@ -141,3 +143,112 @@ def test_storage_key_error_never_embeds_the_absolute_storage_root(storage_root):
     with pytest.raises(storage.StorageKeyError) as excinfo:
         storage.read("../escape")
     assert str(storage_root) not in str(excinfo.value)
+
+
+def test_missing_key_raises_file_not_found_without_leaking_the_absolute_path(storage_root):
+    """A well-formed key that simply has no stored file must stay a
+    FileNotFoundError (distinguishable from a StorageKeyError -- a
+    malformed/hostile key), but its message must not carry the absolute
+    host path the way the raw OSError from Path.read_bytes() does."""
+    with pytest.raises(FileNotFoundError) as excinfo:
+        storage.read("7/does-not-exist")
+    message = str(excinfo.value)
+    assert str(storage_root) not in message
+    assert storage_root.drive not in message
+
+
+def test_write_target_blocked_by_existing_file_raises_clean_storage_key_error(storage_root):
+    """A write whose parent directory collides with an existing plain file
+    (not a directory) cannot succeed. That must surface as StorageKeyError,
+    not a raw OSError carrying the absolute host path."""
+    storage.write("7", b"i am a file, not a directory")
+    with pytest.raises(storage.StorageKeyError) as excinfo:
+        storage.write("7/sub/file", b"x")
+    message = str(excinfo.value)
+    assert str(storage_root) not in message
+    assert storage_root.drive not in message
+
+
+def test_read_wraps_unexpected_os_errors_without_leaking_the_absolute_path(
+    storage_root, monkeypatch
+):
+    key = storage.new_key(7, "aoa")
+    storage.write(key, b"data")
+
+    def boom(self):
+        raise PermissionError(f"[Errno 13] Permission denied: '{self}'")
+
+    monkeypatch.setattr(pathlib.Path, "read_bytes", boom)
+    with pytest.raises(storage.StorageKeyError) as excinfo:
+        storage.read(key)
+    message = str(excinfo.value)
+    assert str(storage_root) not in message
+    assert storage_root.drive not in message
+
+
+def test_write_to_existing_session_directory_raises_storage_key_error(storage_root):
+    """Writing to a key that names an existing directory (not a file) must
+    raise StorageKeyError, not silently succeed or leak a raw OSError."""
+    (storage_root / "7").mkdir(parents=True, exist_ok=True)
+    with pytest.raises(storage.StorageKeyError) as excinfo:
+        storage.write("7", b"x")
+    message = str(excinfo.value)
+    assert str(storage_root) not in message
+    assert storage_root.drive not in message
+
+
+def test_write_wraps_unexpected_os_errors_without_leaking_the_absolute_path(
+    storage_root, monkeypatch
+):
+    """A write that fails for a reason other than a directory collision
+    (e.g. an unwritable target/disk-level permission failure) must also
+    surface as StorageKeyError with no absolute path in the message."""
+
+    def boom(self, data):
+        raise PermissionError(f"[Errno 13] Permission denied: '{self}'")
+
+    monkeypatch.setattr(pathlib.Path, "write_bytes", boom)
+    with pytest.raises(storage.StorageKeyError) as excinfo:
+        storage.write(storage.new_key(7, "aoa"), b"data")
+    message = str(excinfo.value)
+    assert str(storage_root) not in message
+    assert storage_root.drive not in message
+
+
+def test_delete_session_wraps_rmtree_errors_without_leaking_the_absolute_path(
+    storage_root, monkeypatch
+):
+    storage.write(storage.new_key(7, "aoa"), b"data")
+
+    def boom(path, *args, **kwargs):
+        raise PermissionError(f"[Errno 13] Permission denied: '{path}'")
+
+    monkeypatch.setattr(storage.shutil, "rmtree", boom)
+    with pytest.raises(storage.StorageKeyError) as excinfo:
+        storage.delete_session(7)
+    message = str(excinfo.value)
+    assert str(storage_root) not in message
+    assert storage_root.drive not in message
+
+
+def test_delete_session_on_nonexistent_session_is_clean_and_error_free(storage_root):
+    assert storage.delete_session(999) == 0
+
+
+@pytest.mark.parametrize(
+    "key",
+    ["NUL", ".", "", "7", "7/does-not-exist", "../escape", "7/../../escape"],
+)
+def test_no_storage_error_message_ever_leaks_the_absolute_storage_root(key, storage_root):
+    """Generic sweep: for every hostile/invalid/missing key shape this
+    module recognizes, whatever error read()/write() raises must not embed
+    the absolute storage root or its drive letter -- this is the class of
+    leak that must never silently come back in a later task."""
+    (storage_root / "7").mkdir(parents=True, exist_ok=True)
+    for attempt in (lambda: storage.read(key), lambda: storage.write(key, b"x")):
+        try:
+            attempt()
+        except Exception as exc:
+            message = str(exc)
+            assert str(storage_root) not in message
+            assert storage_root.drive not in message
