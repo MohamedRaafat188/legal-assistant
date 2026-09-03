@@ -23,7 +23,7 @@ from legal_assistant.docgen.arabic import to_ascii_digits
 from legal_assistant.docgen.models import SourceMode, UploadKind
 from legal_assistant.docgen.parsing.commercial_register import CompanyRecord
 from legal_assistant.docgen.parsing.signatures import Concept
-from legal_assistant.docgen.patching import Replacement
+from legal_assistant.docgen.patching import PatchResult, Replacement, patch_article
 
 
 class SessionNotFoundError(LookupError):
@@ -100,6 +100,54 @@ def _current_value(field_name: str, article_text: str) -> str:
     return ""
 
 
+def apply_patches(text: str, replacements: Sequence[Replacement]) -> PatchResult:
+    """The single, mandatory entry point for turning `plan_patches` output
+    into a `PatchResult` -- every production call site goes through this,
+    never through `patching.patch_article` directly.
+
+    Why this wrapper exists (the Part 0 fix): `_current_value` cannot always
+    isolate an article's current rendering of a field as a verbatim span --
+    e.g. "المركز الرئيسى فى الجيزة..." has no "الكائن"/"مقرها" anchor for the
+    head-office regex to latch onto. `plan_patches` still has a genuine new
+    value for that field, so it returns a `Replacement` with `old=""`.
+
+    `patching.patch_article` treats an empty `old` as a deliberate no-op --
+    "nothing to do, and nothing suspicious about it" (see its own docstring
+    and `test_empty_old_or_new_is_skipped_silently`) -- and that contract is
+    correct and must not change: a caller that explicitly has no old value in
+    mind for a field is not doing anything wrong. But `plan_patches` is not
+    that caller. It always has a `new` value here (it returns [] otherwise),
+    so an empty `old` from _this_ producer specifically means "a value exists
+    that should have replaced something, and the something could not be
+    found" -- exactly the case `needs_review` exists to catch, and exactly
+    the case that was previously vanishing into `patch_article`'s ordinary
+    no-op path with no note and `needs_review=False`.
+
+    This function is the one place both facts are visible at once (the
+    Replacement's provenance as a `plan_patches` output, and the meaning of
+    an empty `old` as "value present, span not located"), so it is where the
+    two are reconciled: unlocatable replacements are withheld from
+    `patch_article` (so it never has to special-case them) and instead turned
+    into an explicit note naming the field, with `needs_review` forced True.
+    A future caller cannot bypass this by calling `patch_article` directly
+    with a `plan_patches` result, because this function -- not
+    `patch_article` -- is what `_build_article_row` (the only place patches
+    are actually applied to an article) calls.
+    """
+    unlocatable = [r for r in replacements if r.new and not r.old]
+    locatable = [r for r in replacements if r not in unlocatable]
+    result = patch_article(text, locatable)
+    if not unlocatable:
+        return result
+
+    notes = list(result.notes) + [
+        f"[{r.field}] لم يتمكن النظام من تحديد القيمة الحالية لحقل «{r.field}» "
+        f"تلقائيا داخل نص المادة؛ راجع المادة يدويا وحدّثها إلى «{r.new}»."
+        for r in unlocatable
+    ]
+    return PatchResult(text=result.text, ops=result.ops, notes=notes, needs_review=True)
+
+
 def compute_percentages(attendees: Sequence[dict]) -> tuple[str | None, str | None]:
     """(attendance_percentage, approval_percentage) from the attendee list.
 
@@ -115,6 +163,10 @@ def compute_percentages(attendees: Sequence[dict]) -> tuple[str | None, str | No
       both the total and the attending sum, rather than raising or being
       counted as zero. One garbled OCR value must not sink the whole
       computation, and it must not silently masquerade as "no shares held".
+      A share value is still numeric after stripping a trailing "%"/"٪" (a
+      percentage sign copied alongside the number) and the Arabic thousands
+      separator "٬" (U+066C) -- those are punctuation around the figure, not
+      part of it, and must not make an otherwise-good value look unusable.
     - Missing "attending" key -> treated as attending=True (present in the
       list without a stated flag means "listed as present", the common case
       when the source only enumerates who showed up).
@@ -134,8 +186,16 @@ def compute_percentages(attendees: Sequence[dict]) -> tuple[str | None, str | No
         raw = person.get("shares")
         if not raw:
             continue
+        cleaned = (
+            to_ascii_digits(str(raw))
+            .replace(",", "")
+            .replace("%", "")
+            .replace("٪", "")
+            .replace("٬", "")
+            .strip()
+        )
         try:
-            value = float(to_ascii_digits(str(raw)).replace(",", ""))
+            value = float(cleaned)
         except ValueError:
             continue
         total += value

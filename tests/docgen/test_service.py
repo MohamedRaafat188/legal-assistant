@@ -2,8 +2,10 @@ import pytest
 
 from legal_assistant.docgen.parsing.commercial_register import CompanyRecord
 from legal_assistant.docgen.parsing.signatures import Concept
+from legal_assistant.docgen.patching import Replacement
 from legal_assistant.docgen.service import (
     SessionStateError,
+    apply_patches,
     compute_percentages,
     plan_patches,
     validate_source_mode,
@@ -50,6 +52,45 @@ def test_plan_patches_returns_nothing_for_purpose_concept():
     # PURPOSE has no mapped field: purpose text is never machine-patched.
     record = CompanyRecord(company_address="الجيزة")
     assert plan_patches(record, Concept.PURPOSE, "غرض الشركة التجارة العامة.") == []
+
+
+def test_apply_patches_flags_needs_review_when_old_value_is_unlocatable():
+    # This is the exact real-world phrasing the Part 0 fix targets: no
+    # "الكائن"/"مقرها" anchor, so _current_value cannot isolate a span, but
+    # plan_patches still has a genuine new address to apply.
+    record = CompanyRecord(company_address="٥ شارع الهرم، الجيزة")
+    text = "المركز الرئيسى فى الجيزة، جمهورية مصر العربية."
+    replacements = plan_patches(record, Concept.HEAD_OFFICE, text)
+    assert replacements[0].old == ""  # confirms the helper could not locate a span
+
+    result = apply_patches(text, replacements)
+    assert result.text == text  # unchanged -- no guessing
+    assert result.ops == []
+    assert result.needs_review is True
+    assert len(result.notes) == 1
+    assert "company_address" in result.notes[0]
+
+
+def test_apply_patches_still_applies_locatable_replacements_normally():
+    text = "المركز الرئيسى للشركة الكائن فى ١٢ شارع النيل."
+    replacements = [Replacement("company_address", "١٢ شارع النيل", "٥ شارع الهرم", "cr")]
+    result = apply_patches(text, replacements)
+    assert "٥ شارع الهرم" in result.text
+    assert result.needs_review is False
+    assert result.notes == []
+
+
+def test_apply_patches_reports_both_a_normal_note_and_an_unlocatable_one():
+    text = "نص لا صلة له بأى قيمة."
+    replacements = [
+        # Not present verbatim in `text` -> patch_article's own "missing" note.
+        Replacement("capital", "غير موجود", "200000", "cr"),
+        Replacement("company_address", "", "الجيزة", "cr"),  # unlocatable
+    ]
+    result = apply_patches(text, replacements)
+    assert result.needs_review is True
+    assert any("capital" in n for n in result.notes)
+    assert any("company_address" in n for n in result.notes)
 
 
 def test_compute_percentages_sums_shares_into_percentages():
@@ -108,6 +149,27 @@ def test_compute_percentages_treats_zero_total_as_unknown():
     # "0") must not raise a ZeroDivisionError or fabricate a percentage.
     attendees = [{"name": "أ", "shares": "0", "attending": True}]
     assert compute_percentages(attendees) == (None, None)
+
+
+def test_compute_percentages_strips_a_percent_sign_before_parsing():
+    attendees = [
+        {"name": "أ", "shares": "50%", "attending": True},
+        {"name": "ب", "shares": "50%", "attending": False},
+    ]
+    assert compute_percentages(attendees) == ("50", "50")
+
+
+def test_compute_percentages_strips_an_arabic_percent_sign_before_parsing():
+    attendees = [
+        {"name": "أ", "shares": "90٪", "attending": True},
+        {"name": "ب", "shares": "10٪", "attending": False},
+    ]
+    assert compute_percentages(attendees) == ("90", "90")
+
+
+def test_compute_percentages_strips_the_arabic_thousands_separator():
+    attendees = [{"name": "أ", "shares": "١٠٠٬٠٠٠", "attending": True}]
+    assert compute_percentages(attendees) == ("100", "100")
 
 
 def test_validate_source_mode_requires_a_cr_upload_in_aoa_plus_cr_mode():
