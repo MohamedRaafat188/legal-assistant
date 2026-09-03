@@ -476,6 +476,25 @@ def _raise_if_expired(session: DocgenSession) -> None:
         raise SessionNotFoundError(f"docgen session {session.id} not found")
 
 
+async def _load_session_unowned(db: AsyncSession, session_id: int) -> DocgenSession | None:
+    """Load a session by id with no `user_id` check, for internal (job)
+    callers that are not acting on behalf of a specific caller.
+
+    `run_ocr_job` and `_run_ocr` both need exactly this load -- there is no
+    `user_id` here, this is a background job, so `get_session` does not
+    apply. This is the one place both go through, so the load itself (and
+    any future eager-loading it needs) cannot drift between the two call
+    sites. It deliberately does NOT decide what to do about expiry: the two
+    callers need different answers (see their own docstrings/comments) for
+    what happens once a session has expired mid-job, so that decision stays
+    at the call site, made against the shared `_is_expired` predicate
+    (`get_session`, `purge_expired`, and this module's docstring already
+    treat `_is_expired` as the one place the expiry comparison itself
+    lives -- this function does not re-implement it).
+    """
+    return await db.get(DocgenSession, session_id)
+
+
 async def get_session(db: AsyncSession, session_id: int, user_id: int) -> DocgenSession:
     """Load a session the caller owns.
 
@@ -627,8 +646,29 @@ async def run_ocr_job(session_id: int) -> None:
             "docgen OCR job failed for session %s: %s", session_id, type(e).__name__
         )
         async with sessionmaker() as db:
-            session = await db.get(DocgenSession, session_id)
-            if session is not None:
+            try:
+                session = await _load_session_unowned(db, session_id)
+                expired = session is not None and _is_expired(session)
+            except Exception as inner:  # noqa: BLE001 -- must not mask the
+                # original failure being handled in this except block; log
+                # the TYPE only (same content-free convention as elsewhere
+                # in this handler) and treat it as "nothing to write".
+                _log.error(
+                    "docgen OCR job failure handler could not check session "
+                    "%s expiry (%s); leaving its status untouched",
+                    session_id,
+                    type(inner).__name__,
+                )
+                session, expired = None, False
+            # This write is only a content-free status/error, not new PII,
+            # but the session's window may have closed during the run this
+            # failure came from -- skip the write entirely rather than
+            # touch an expired session at all. Whatever `status` it is left
+            # at (almost certainly `ocr_running`, from the Fix-3 claim) is
+            # inert: `get_session`'s expiry check is time-based, not
+            # status-based, and `purge_expired` will still collect it on
+            # its own schedule regardless of `status`.
+            if session is not None and not expired:
                 session.status = SessionStatus.failed.value
                 session.error = message
                 await db.commit()
@@ -701,7 +741,35 @@ async def _run_ocr(session_id: int) -> None:
 
     # 5. Patch and persist.
     async with sessionmaker() as db:
-        session = await db.get(DocgenSession, session_id)
+        session = await _load_session_unowned(db, session_id)
+        if session is None:
+            _log.warning(
+                "docgen OCR result for session %s discarded: session vanished "
+                "during processing",
+                session_id,
+            )
+            return
+        if _is_expired(session):
+            # The session's window closed somewhere during the classify/OCR/
+            # extract calls above -- real external round-trips, not a
+            # negligible gap, unlike the claim-to-first-SELECT hop at the top
+            # of this function. Abandon the result outright: do not persist
+            # the newly OCR'd DocgenArticle rows or DocgenFields.data (both
+            # carry identity-document content), and do not flip status to
+            # `ready`. Land it in `failed` instead of leaving it stuck in
+            # `ocr_running` forever -- a content-free status/error write, not
+            # new PII, and `get_session` already blocks this session by
+            # `expires_at` regardless of `status`, so this cannot restore
+            # read access.
+            session.status = SessionStatus.failed.value
+            session.error = "انتهت المهلة المتاحة لهذه الجلسة أثناء المعالجة."
+            await _safe_commit(db)
+            _log.warning(
+                "docgen OCR result for session %s discarded: session expired "
+                "during processing",
+                session_id,
+            )
+            return
         aoa_row = await db.get(DocgenUpload, aoa.id)
         aoa_row.page_classification = [
             {

@@ -3,7 +3,11 @@ import datetime
 
 import pytest
 
-from legal_assistant.docgen.models import DocgenSession
+from legal_assistant.docgen import pdf, service, storage
+from legal_assistant.docgen.models import DocgenSession, DocgenUpload
+from legal_assistant.docgen.ocr.base import PageClassification, PageKind, PageText
+from legal_assistant.docgen.parsing import sections
+from legal_assistant.docgen.parsing.articles import ExtractedArticle
 from legal_assistant.docgen.parsing.commercial_register import CompanyRecord
 from legal_assistant.docgen.parsing.signatures import Concept
 from legal_assistant.docgen.patching import Replacement
@@ -11,11 +15,13 @@ from legal_assistant.docgen.service import (
     SessionNotFoundError,
     SessionStateError,
     _claim_for_ocr_statement,
+    _load_session_unowned,
     _reconcile_capital,
     apply_patches,
     compute_percentages,
     get_session,
     plan_patches,
+    run_ocr_job,
     validate_source_mode,
 )
 
@@ -43,6 +49,9 @@ class _FakeDb:
 
     async def execute(self, *_args, **_kwargs):
         return _FakeScalarResult(self._value)
+
+    async def get(self, *_args, **_kwargs):
+        return self._value
 
 
 def _days_ago(n: int) -> datetime.datetime:
@@ -355,6 +364,213 @@ def test_claim_for_ocr_statement_sets_ocr_running_and_clears_the_error():
     )
     assert "status='ocr_running'" in compiled
     assert "error=NULL" in compiled
+
+
+def test_load_session_unowned_returns_none_for_a_missing_session():
+    assert asyncio.run(_load_session_unowned(_FakeDb(None), session_id=1)) is None
+
+
+def test_load_session_unowned_returns_whatever_status_the_row_has():
+    # Deliberately no expiry/ownership decision baked in here -- that is left
+    # to the caller (see `run_ocr_job`/`_run_ocr`), which need different
+    # answers to "what do I do about an expired session".
+    session = _session(status="ocr_running", expires_at=_days_ago(5))
+    result = asyncio.run(_load_session_unowned(_FakeDb(session), session_id=1))
+    assert result is session
+
+
+class _FakeScalarOneResult:
+    def __init__(self, value):
+        self._value = value
+
+    def scalar_one(self):
+        return self._value
+
+
+class _FakeRunOcrDb:
+    """Stands in for the `AsyncSession` `_run_ocr` opens -- once at the top
+    (to load `uploads`/`company_type`/`source_mode`) and again for "5. Patch
+    and persist" -- both times via the same `sessionmaker()` stub, so this
+    one fake instance backs both. `execute` only ever needs to satisfy the
+    first (a `select(DocgenSession)...scalar_one()`); the persist step's own
+    writes (`DocgenArticle` delete/insert, the `DocgenFields` update) are
+    deliberately NOT implemented here -- if the abandonment branch is not
+    taken and one of those is reached, it raises `AttributeError`, which
+    fails the test loudly rather than silently accepting a write that
+    should not happen.
+    """
+
+    def __init__(self, session):
+        self.session = session
+        self.commits = 0
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def execute(self, stmt):
+        return _FakeScalarOneResult(self.session)
+
+    async def get(self, model, pk):
+        assert model is DocgenSession
+        return self.session
+
+    async def commit(self):
+        self.commits += 1
+
+
+def test_run_ocr_persist_step_abandons_the_result_when_the_session_expires_mid_run(
+    monkeypatch,
+):
+    # Reproduces the re-review's residual finding: the claim at job start
+    # only guarantees the session was not-yet-expired at that instant.
+    # `_run_ocr` then makes several external OCR/extraction calls before
+    # reaching "5. Patch and persist" -- a real window, not a negligible
+    # one -- and the session must not be written to if it closed during that
+    # window: no new DocgenArticle/DocgenFields content, and no `ready`.
+    session = _session(id=1, status="ocr_running", expires_at=_days_from_now(1))
+    aoa_upload = DocgenUpload(
+        id=10, session_id=1, kind="aoa", filename="a.pdf", storage_key="k1"
+    )
+    session.uploads = [aoa_upload]
+    db = _FakeRunOcrDb(session)
+
+    class _FakeSettings:
+        docgen_classify_dpi = 72
+        docgen_ocr_dpi = 150
+
+    class _FakeProvider:
+        async def classify_pages(self, images):
+            return [
+                PageClassification(
+                    page=1, kind=PageKind.body, starts_article=True, confidence=1.0
+                )
+            ]
+
+        async def extract(self, images):
+            # The window closes DURING this external OCR call -- after the
+            # Fix-3 claim, before the persist step below ever loads the row.
+            session.expires_at = _days_ago(1)
+            return [PageText(page=1, text="نص المادة الأولى.", confidence=0.9)]
+
+    async def fake_extract_fields(provider, source_mode, uploads, articles, settings):
+        return CompanyRecord(), {}
+
+    monkeypatch.setattr(service, "get_settings", lambda: _FakeSettings())
+    monkeypatch.setattr(service, "get_provider", lambda settings: _FakeProvider())
+    monkeypatch.setattr(service, "get_sessionmaker", lambda: (lambda: db))
+    monkeypatch.setattr(service, "_extract_fields", fake_extract_fields)
+    monkeypatch.setattr(storage, "read", lambda key: b"%PDF-fake%")
+    monkeypatch.setattr(pdf, "render_pages", lambda data, dpi=None, pages=None: ["thumb"])
+    monkeypatch.setattr(sections, "split_instruments", lambda text: ["instrument"])
+    monkeypatch.setattr(
+        sections,
+        "select_target",
+        lambda instruments, company_type: (
+            [ExtractedArticle(number=1, heading="المادة الأولى", body="نص", start=0, end=3)],
+            None,
+        ),
+    )
+
+    asyncio.run(service._run_ocr(1))
+
+    # (a) no article/fields writes were attempted -- proven structurally:
+    # `_FakeRunOcrDb` has no `execute`/`add`/`scalar`, so reaching either the
+    # `DocgenArticle` delete/insert or the `DocgenFields` update would have
+    # raised `AttributeError` and failed this test.
+    # (b) not left stuck in `ocr_running`.
+    assert session.status == "failed"
+    # (c) not flipped to `ready`.
+    assert session.status != "ready"
+    assert db.commits == 1
+
+
+class _FakeFailureHandlerDb:
+    """Stands in for the `AsyncSession` `run_ocr_job`'s outer `except`
+    handler opens to record a failure. Only `db.get` and `db.commit` are
+    implemented, for the same "an unexpected write would raise loudly"
+    reason as `_FakeRunOcrDb` above.
+    """
+
+    def __init__(self, session):
+        self.session = session
+        self.commits = 0
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def get(self, model, pk):
+        return self.session
+
+    async def commit(self):
+        self.commits += 1
+
+
+class _FakeClaimDb:
+    """Stands in for the `AsyncSession` `run_ocr_job` opens for the Fix-3
+    atomic claim. `rowcount=1` simulates a successful claim -- this test is
+    about what happens AFTER the claim, when `_run_ocr` itself fails.
+    """
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def execute(self, stmt):
+        return type("Result", (), {"rowcount": 1})()
+
+    async def commit(self):
+        pass
+
+
+def test_run_ocr_job_failure_handler_skips_the_write_when_the_session_has_expired(
+    monkeypatch,
+):
+    # Lower-stakes than the persist-step case (no new PII, only a
+    # content-free status/error), but the same principle: do not write to a
+    # session whose window has already closed, even a status flip.
+    session = _session(id=1, status="ocr_running", expires_at=_days_ago(1))
+    failure_db = _FakeFailureHandlerDb(session)
+    dbs = iter([_FakeClaimDb(), failure_db])
+    monkeypatch.setattr(service, "get_sessionmaker", lambda: (lambda: next(dbs)))
+
+    async def fake_run_ocr(session_id):
+        raise service.OcrError("لم يتم العثور على مواد قابلة للتعديل داخل الملف.")
+
+    monkeypatch.setattr(service, "_run_ocr", fake_run_ocr)
+
+    asyncio.run(run_ocr_job(1))
+
+    assert session.status == "ocr_running"  # untouched, not overwritten to "failed"
+    assert session.error is None
+    assert failure_db.commits == 0
+
+
+def test_run_ocr_job_failure_handler_writes_when_the_session_has_not_expired(monkeypatch):
+    # Contrast case: the ordinary path (session still valid) must still work
+    # exactly as before this fix -- status/error get written.
+    session = _session(id=1, status="ocr_running", expires_at=_days_from_now(1))
+    failure_db = _FakeFailureHandlerDb(session)
+    dbs = iter([_FakeClaimDb(), failure_db])
+    monkeypatch.setattr(service, "get_sessionmaker", lambda: (lambda: next(dbs)))
+
+    async def fake_run_ocr(session_id):
+        raise service.OcrError("لم يتم العثور على مواد قابلة للتعديل داخل الملف.")
+
+    monkeypatch.setattr(service, "_run_ocr", fake_run_ocr)
+
+    asyncio.run(run_ocr_job(1))
+
+    assert session.status == "failed"
+    assert session.error == "لم يتم العثور على مواد قابلة للتعديل داخل الملف."
+    assert failure_db.commits == 1
 
 
 def test_validate_source_mode_requires_a_cr_upload_in_aoa_plus_cr_mode():
