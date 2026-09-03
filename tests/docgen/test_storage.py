@@ -235,6 +235,43 @@ def test_delete_session_on_nonexistent_session_is_clean_and_error_free(storage_r
     assert storage.delete_session(999) == 0
 
 
+def test_delete_removes_a_single_file(storage_root):
+    key = storage.new_key(7, "document")
+    storage.write(key, b"docx bytes")
+    storage.delete(key)
+    with pytest.raises(FileNotFoundError):
+        storage.read(key)
+
+
+def test_delete_of_a_missing_key_is_a_silent_no_op(storage_root):
+    # Deleting something already gone (e.g. a stale pointer, or a retry
+    # after a partial failure) must not raise.
+    storage.delete("7/does-not-exist")
+
+
+def test_delete_rejects_a_key_naming_a_directory(storage_root):
+    (storage_root / "7").mkdir(parents=True, exist_ok=True)
+    with pytest.raises(storage.StorageKeyError):
+        storage.delete("7")
+
+
+def test_delete_wraps_unexpected_os_errors_without_leaking_the_absolute_path(
+    storage_root, monkeypatch
+):
+    key = storage.new_key(7, "document")
+    storage.write(key, b"data")
+
+    def boom(self, missing_ok=False):
+        raise PermissionError(f"[Errno 13] Permission denied: '{self}'")
+
+    monkeypatch.setattr(pathlib.Path, "unlink", boom)
+    with pytest.raises(storage.StorageKeyError) as excinfo:
+        storage.delete(key)
+    message = str(excinfo.value)
+    assert str(storage_root) not in message
+    assert storage_root.drive not in message
+
+
 @pytest.mark.parametrize(
     "key",
     ["NUL", ".", "", "7", "7/does-not-exist", "../escape", "7/../../escape"],

@@ -1,16 +1,69 @@
+import asyncio
+import datetime
+
 import pytest
 
+from legal_assistant.docgen.models import DocgenSession
 from legal_assistant.docgen.parsing.commercial_register import CompanyRecord
 from legal_assistant.docgen.parsing.signatures import Concept
 from legal_assistant.docgen.patching import Replacement
 from legal_assistant.docgen.service import (
+    SessionNotFoundError,
     SessionStateError,
+    _claim_for_ocr_statement,
     _reconcile_capital,
     apply_patches,
     compute_percentages,
+    get_session,
     plan_patches,
     validate_source_mode,
 )
+
+
+class _FakeScalarResult:
+    """Stands in for the object `AsyncSession.execute()` returns -- only
+    `.scalar_one_or_none()` is exercised by `get_session`. Deliberately does
+    NOT evaluate the SQL `.where()` predicates a real engine would (there is
+    no real query here at all): this is what lets these tests demonstrate
+    `get_session`'s own Python-level expiry/ownership logic offline, with no
+    DB, and prove it does not rely solely on a WHERE clause a stub like this
+    could never enforce.
+    """
+
+    def __init__(self, value):
+        self._value = value
+
+    def scalar_one_or_none(self):
+        return self._value
+
+
+class _FakeDb:
+    def __init__(self, value) -> None:
+        self._value = value
+
+    async def execute(self, *_args, **_kwargs):
+        return _FakeScalarResult(self._value)
+
+
+def _days_ago(n: int) -> datetime.datetime:
+    return datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=n)
+
+
+def _days_from_now(n: int) -> datetime.datetime:
+    return datetime.datetime.now(datetime.UTC) + datetime.timedelta(days=n)
+
+
+def _session(**overrides) -> DocgenSession:
+    defaults = dict(
+        id=1,
+        user_id=7,
+        company_type="zmm",
+        source_mode="aoa_only",
+        status="ready",
+        expires_at=datetime.datetime.now(datetime.UTC) + datetime.timedelta(days=1),
+    )
+    defaults.update(overrides)
+    return DocgenSession(**defaults)
 
 
 def test_plan_patches_targets_the_head_office_article_with_the_address():
@@ -208,6 +261,100 @@ def test_reconcile_capital_allows_small_rounding_slack():
     # gap wider than ~1% is treated as a real discrepancy.
     attendees = [{"shares": "99.6"}]
     assert _reconcile_capital(attendees, "100") is None
+
+
+def test_get_session_rejects_an_expired_session_even_when_status_still_says_ready():
+    # The reviewer's exact reproduction: status was never touched by time
+    # passing (only purge_expired ever sets status="expired"), so a session
+    # 5 days past its window but still "ready" must still be rejected.
+    session = _session(status="ready", expires_at=_days_ago(5))
+    db = _FakeDb(session)
+    with pytest.raises(SessionNotFoundError):
+        asyncio.run(get_session(db, session_id=1, user_id=7))
+
+
+def test_get_session_rejects_a_session_already_marked_expired():
+    session = _session(status="expired", expires_at=_days_ago(5))
+    db = _FakeDb(session)
+    with pytest.raises(SessionNotFoundError):
+        asyncio.run(get_session(db, session_id=1, user_id=7))
+
+
+def test_get_session_accepts_a_session_that_has_not_yet_expired():
+    session = _session(status="ready", expires_at=_days_from_now(1))
+    db = _FakeDb(session)
+    result = asyncio.run(get_session(db, session_id=1, user_id=7))
+    assert result is session
+
+
+def test_get_session_rejects_another_users_session_with_the_identical_error():
+    # A real query's WHERE clause already excludes another user's row (a
+    # stub cannot exercise that), so this proves the Python-level fallback
+    # check catches it too, with the same exception the "not found" and
+    # "expired" cases raise -- never a distinguishable one.
+    session = _session(user_id=42, expires_at=_days_from_now(1))
+    db = _FakeDb(session)
+    with pytest.raises(SessionNotFoundError):
+        asyncio.run(get_session(db, session_id=1, user_id=7))
+
+
+def test_get_session_rejects_a_missing_session_with_the_identical_error():
+    db = _FakeDb(None)
+    with pytest.raises(SessionNotFoundError):
+        asyncio.run(get_session(db, session_id=999, user_id=7))
+
+
+def test_get_session_expired_and_missing_raise_the_same_exception_type():
+    # Not just "both raise" -- the SAME type, with no attribute that would
+    # let a caller tell "expired" apart from "never existed" or "not yours".
+    # A real query also filters by user_id in its WHERE clause (see
+    # get_session's docstring); this stub cannot exercise that SQL-level
+    # filter, but it still proves the Python-level path never distinguishes
+    # the cases by exception type.
+    expired_db = _FakeDb(_session(expires_at=_days_ago(5)))
+    missing_db = _FakeDb(None)
+    with pytest.raises(SessionNotFoundError) as expired_exc:
+        asyncio.run(get_session(expired_db, session_id=1, user_id=7))
+    with pytest.raises(SessionNotFoundError) as missing_exc:
+        asyncio.run(get_session(missing_db, session_id=1, user_id=7))
+    assert type(expired_exc.value) is type(missing_exc.value)
+
+
+def test_claim_for_ocr_statement_only_targets_the_named_session():
+    compiled = str(
+        _claim_for_ocr_statement(42).compile(compile_kwargs={"literal_binds": True})
+    )
+    assert "docgen_sessions.id = 42" in compiled
+
+
+def test_claim_for_ocr_statement_refuses_an_already_running_session():
+    # This WHERE clause is the entire re-entrancy guarantee: it is evaluated
+    # atomically by the database as part of a single UPDATE, so a second
+    # concurrent run_ocr_job for the same session_id sees the row AFTER the
+    # first UPDATE committed and matches zero rows -- there is no
+    # read-then-write gap for two invocations to both slip through.
+    compiled = str(
+        _claim_for_ocr_statement(1).compile(compile_kwargs={"literal_binds": True})
+    )
+    assert "docgen_sessions.status != 'ocr_running'" in compiled
+
+
+def test_claim_for_ocr_statement_refuses_an_expired_session():
+    # Same statement, same atomicity guarantee, closing the Fix-1 gap for
+    # run_ocr_job specifically: it must not start OCR on a session already
+    # past its retention window, whether or not purge_expired has run yet.
+    compiled = str(
+        _claim_for_ocr_statement(1).compile(compile_kwargs={"literal_binds": True})
+    )
+    assert "docgen_sessions.expires_at > now()" in compiled
+
+
+def test_claim_for_ocr_statement_sets_ocr_running_and_clears_the_error():
+    compiled = str(
+        _claim_for_ocr_statement(1).compile(compile_kwargs={"literal_binds": True})
+    )
+    assert "status='ocr_running'" in compiled
+    assert "error=NULL" in compiled
 
 
 def test_validate_source_mode_requires_a_cr_upload_in_aoa_plus_cr_mode():

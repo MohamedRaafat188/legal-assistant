@@ -131,6 +131,21 @@ def read(key: str) -> bytes:
         raise StorageKeyError(f"storage key could not be read: {key!r}") from e
 
 
+def delete(key: str) -> None:
+    """Delete one stored file. Idempotent: a key naming no file is a silent
+    no-op -- deleting something already gone is not an error, unlike `read`
+    (where a missing file usually signals a caller's bug or a stale
+    reference). Used to clean up a superseded object (e.g. a previous
+    rendered .docx) after its replacement is already safely written."""
+    path = _resolve(key)
+    if path.exists() and not path.is_file():
+        raise StorageKeyError(f"storage key does not name a file: {key!r}")
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as e:
+        raise StorageKeyError(f"storage key could not be deleted: {key!r}") from e
+
+
 def delete_session(session_id: int) -> int:
     """Delete every file stored for a session. Returns how many were removed."""
     directory = _resolve(str(session_id))

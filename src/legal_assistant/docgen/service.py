@@ -20,12 +20,13 @@ all carry a partner's national ID or passport number. See `_fail_stage`,
 
 from __future__ import annotations
 
+import datetime
 import logging
 import re
 from collections.abc import Coroutine, Sequence
 from typing import Any, NoReturn, TypeVar
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -445,6 +446,36 @@ async def create_session(
     return session
 
 
+def _is_expired(session: DocgenSession, *, now: datetime.datetime | None = None) -> bool:
+    """True if `session` is past its retention window, by TIME -- not by
+    whatever `status` happens to say.
+
+    `purge_expired` is the only thing that ever sets `status="expired"`, and
+    it runs on a schedule: a session's declared 2-day window has nothing to
+    do with when that job next ticks. A `status`-only check can therefore
+    never substitute for a timestamp check -- a `status="ready"` session
+    whose `expires_at` is 5 days in the past is exactly as expired as one
+    already marked `status="expired"`, just not yet visited by the purge
+    job. Both are treated identically here.
+
+    `expires_at` is stored `DateTime(timezone=True)` and always constructed
+    via `default_expires_at` (tz-aware, anchored to `datetime.UTC`), so
+    comparing it against an aware `datetime.now(datetime.UTC)` compares two
+    aware instants directly -- correct regardless of which tzinfo offset the
+    driver hands back, and with no naive/aware mismatch to fail open or
+    raise on.
+    """
+    if session.status == SessionStatus.expired.value:
+        return True
+    now = now or datetime.datetime.now(datetime.UTC)
+    return session.expires_at <= now
+
+
+def _raise_if_expired(session: DocgenSession) -> None:
+    if _is_expired(session):
+        raise SessionNotFoundError(f"docgen session {session.id} not found")
+
+
 async def get_session(db: AsyncSession, session_id: int, user_id: int) -> DocgenSession:
     """Load a session the caller owns.
 
@@ -455,10 +486,26 @@ async def get_session(db: AsyncSession, session_id: int, user_id: int) -> Docgen
     This is the sole authorization gate: every other function in this module
     takes an already-loaded `DocgenSession`, so it is reachable only through
     a session this function returned.
+
+    Both ownership and expiry are filtered in the query itself
+    (`user_id == user_id`, `expires_at > func.now()` -- the latter
+    consistent with how `purge_expired` compares, and evaluated by the same
+    clock as every other row in the database rather than this process's
+    wall clock) AND re-checked in Python immediately after load. The second
+    layer is deliberate belt-and-suspenders, not redundant ceremony: it is
+    what makes this function's authorization/expiry behavior verifiable with
+    a stubbed `AsyncSession` that does not actually evaluate SQL predicates
+    (see `tests/docgen/test_service.py`), and it is also what protects any
+    future caller that constructs the WHERE clause differently or forgets a
+    predicate.
     """
     result = await db.execute(
         select(DocgenSession)
-        .where(DocgenSession.id == session_id, DocgenSession.user_id == user_id)
+        .where(
+            DocgenSession.id == session_id,
+            DocgenSession.user_id == user_id,
+            DocgenSession.expires_at > func.now(),
+        )
         .options(
             selectinload(DocgenSession.articles),
             selectinload(DocgenSession.uploads),
@@ -466,8 +513,9 @@ async def get_session(db: AsyncSession, session_id: int, user_id: int) -> Docgen
         )
     )
     session = result.scalar_one_or_none()
-    if session is None or session.status == SessionStatus.expired.value:
+    if session is None or session.user_id != user_id:
         raise SessionNotFoundError(f"docgen session {session_id} not found")
+    _raise_if_expired(session)
     return session
 
 
@@ -498,6 +546,27 @@ async def add_upload(
     return upload
 
 
+def _claim_for_ocr_statement(session_id: int):
+    """The atomic claim `run_ocr_job` uses to start OCR for `session_id`.
+
+    Pulled out as its own (pure, DB-independent) function so its WHERE
+    clause -- the whole re-entrancy/expiry guarantee -- can be asserted on
+    directly (compiled to a literal SQL string) without a database
+    connection; see `test_claim_for_ocr_statement_*` in
+    `tests/docgen/test_service.py`. The statement itself is only ever
+    executed from `run_ocr_job`.
+    """
+    return (
+        update(DocgenSession)
+        .where(
+            DocgenSession.id == session_id,
+            DocgenSession.status != SessionStatus.ocr_running.value,
+            DocgenSession.expires_at > func.now(),
+        )
+        .values(status=SessionStatus.ocr_running.value, error=None)
+    )
+
+
 async def run_ocr_job(session_id: int) -> None:
     """Background entry point: classify, OCR, segment, extract, patch.
 
@@ -506,21 +575,36 @@ async def run_ocr_job(session_id: int) -> None:
     session in `failed` with a content-free Arabic message (see the module
     note on error handling); uploads are kept so the lawyer can retry
     without re-uploading.
+
+    Starts with a single atomic `UPDATE ... WHERE status != 'ocr_running'
+    AND expires_at > now()` rather than a SELECT followed by a separate
+    UPDATE. This is not just tidier -- it is the only one of the two that
+    actually closes the race: a read-then-write check has a window between
+    the read and the write in which two concurrent invocations for the same
+    `session_id` can both observe "not running" and both proceed to burn
+    billed vision calls and interleave writes to the same rows. A single
+    UPDATE has no such window -- Postgres serializes concurrent UPDATEs
+    against the same row, so the first to commit is the only one whose WHERE
+    clause is evaluated against the pre-update state; the second's WHERE
+    clause is evaluated against the row *after* the first UPDATE, sees
+    `status = 'ocr_running'`, and matches zero rows. `result.rowcount == 0`
+    is therefore a genuine "did not win the race" signal, not merely "was
+    unlikely to have raced". The same statement enforces the Fix-1 expiry
+    check with the identical guarantee: this is also the only place
+    `run_ocr_job` loads a session, and it must not start OCR (more OCR'd
+    document content, more billed calls) against a session already past its
+    retention window, whether or not `purge_expired` has visited it yet.
     """
     sessionmaker = get_sessionmaker()
     async with sessionmaker() as db:
-        result = await db.execute(
-            select(DocgenSession)
-            .where(DocgenSession.id == session_id)
-            .options(selectinload(DocgenSession.uploads), selectinload(DocgenSession.fields))
-        )
-        session = result.scalar_one_or_none()
-        if session is None:
-            _log.warning("docgen OCR job for missing session %s", session_id)
+        result = await db.execute(_claim_for_ocr_statement(session_id))
+        if result.rowcount == 0:
+            _log.warning(
+                "docgen OCR job for session %s did not start "
+                "(missing, expired, or already running)",
+                session_id,
+            )
             return
-
-        session.status = SessionStatus.ocr_running.value
-        session.error = None
         await _safe_commit(db)
 
     try:
@@ -941,11 +1025,32 @@ async def render_session(db: AsyncSession, session: DocgenSession) -> bytes:
     )
 
     document = render_document(session.company_type, context)
+    previous_key = session.document_key
     key = storage.new_key(session.id, "document")
+    # Write the NEW object and commit the pointer to it before touching the
+    # old one: if deleting the old object then failed partway (e.g. an OSError
+    # mid-unlink), the session must still point at a document that exists --
+    # never at one it just deleted.
     _run_stage_sync("حفظ المستند الناتج", storage.write, key, document)
     session.document_key = key
     session.status = SessionStatus.rendered.value
     await _safe_flush(db)
+
+    if previous_key and previous_key != key:
+        # Best-effort: a session should not accumulate stale renders of a
+        # document containing partners' ID numbers, but a failure to remove
+        # the superseded one is not fatal -- the new, already-committed
+        # document is what matters, and the old object is still purged with
+        # the rest of the session's files at expiry/deletion regardless.
+        try:
+            storage.delete(previous_key)
+        except StorageKeyError as e:
+            _log.error(
+                "docgen render: could not delete the previous rendered "
+                "document for session %s: %s",
+                session.id,
+                type(e).__name__,
+            )
     return document
 
 
