@@ -37,12 +37,33 @@ class PageClassification:
     starts_article: bool
     confidence: float
 
+    # No field here carries document text today, but this class is rendered
+    # by whatever logs/asserts on it (Task 14's orchestrator, in particular).
+    # A custom __repr__ means a future text-bearing field must be added to it
+    # deliberately to appear in repr() -- the default frozen-dataclass repr
+    # would include it silently.
+    def __repr__(self) -> str:
+        return (
+            f"PageClassification(page={self.page!r}, kind={self.kind!r}, "
+            f"starts_article={self.starts_article!r}, confidence={self.confidence!r})"
+        )
+
 
 @dataclass(frozen=True)
 class PageText:
     page: int
     text: str
     confidence: float
+
+    # `text` is transcribed document content -- possibly a partner's national
+    # ID or passport number, copied verbatim per the extraction prompt. The
+    # default frozen-dataclass repr would embed it in full in any log line,
+    # assertion failure, or debugger frame. Report only its length.
+    def __repr__(self) -> str:
+        return (
+            f"PageText(page={self.page!r}, text=<{len(self.text)} chars>, "
+            f"confidence={self.confidence!r})"
+        )
 
 
 @runtime_checkable
@@ -57,8 +78,17 @@ class OcrProvider(Protocol):
 
 
 def body_pages(classifications: Sequence[PageClassification]) -> list[int]:
-    """Sorted page numbers of the contract body."""
-    return sorted(c.page for c in classifications if c.kind is PageKind.body)
+    """Sorted, de-duplicated page numbers of the contract body.
+
+    A well-behaved provider never emits two `PageClassification`s for the
+    same page, but this is a public function over caller-supplied data, not
+    just the Gemini provider's output -- silently returning `[2, 2]` for a
+    duplicate is the same silent-data-shape bug this codebase has hit
+    before. A duplicate page number is unambiguous (it is still just page 2
+    of the body) and de-duplicating is what "sorted page numbers" already
+    implies, so this dedupes rather than raising.
+    """
+    return sorted({c.page for c in classifications if c.kind is PageKind.body})
 
 
 def get_provider(settings: Settings | None = None) -> OcrProvider:

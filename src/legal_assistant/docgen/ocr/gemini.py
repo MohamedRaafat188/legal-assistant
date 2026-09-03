@@ -21,7 +21,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
-import logging
 from collections.abc import Sequence
 
 from legal_assistant.config import Settings, get_settings
@@ -33,8 +32,6 @@ from legal_assistant.docgen.ocr.base import (
 )
 from legal_assistant.docgen.pdf import PageImage
 from legal_assistant.llm import get_llm
-
-_log = logging.getLogger(__name__)
 
 _CLASSIFY_PROMPT = """أنت تصنّف صفحات ملف ممسوح ضوئيا لعقد تأسيس شركة مصرية.
 
@@ -80,15 +77,31 @@ def _image_part(image: PageImage) -> dict:
     return {"type": "image_url", "image_url": f"data:image/png;base64,{encoded}"}
 
 
-def _parse_json(raw: str) -> object:
-    """Parse a model response that may be wrapped in a ```json fence."""
+def _parse_json(raw: str, *, source: str) -> object:
+    """Parse a model response that may be wrapped in a ```json fence.
+
+    `raw` is untrusted model output -- a page transcription or a سجل تجارى
+    field extraction -- and may contain a partner's national ID or passport
+    number copied verbatim. It must never appear in a raised exception, so
+    on failure only the call site (`source`), the response length, and the
+    parser's own (content-free) error position are reported.
+
+    Chained `from None`: `json.JSONDecodeError.__str__` is just a position,
+    but the exception object also carries the full un-parsed text on its
+    `.doc` attribute, which a structured log formatter that serializes
+    exception attributes (not just `str(exc)`) would emit. Suppressing the
+    cause is the only way to guarantee that attribute never reaches a log.
+    """
     text = raw.strip()
     if text.startswith("```"):
         text = text.split("\n", 1)[1].rsplit("```", 1)[0]
     try:
         return json.loads(text)
     except json.JSONDecodeError as e:
-        raise OcrError(f"OCR provider returned non-JSON: {raw[:200]!r}") from e
+        raise OcrError(
+            f"OCR provider ({source}) returned a response that is not valid JSON "
+            f"(length={len(raw)} chars, parse error at character {e.pos})"
+        ) from None
 
 
 class GeminiOcrProvider:
@@ -104,7 +117,15 @@ class GeminiOcrProvider:
         try:
             response = await self._llm.ainvoke([{"role": "user", "content": content}])
         except Exception as e:  # noqa: BLE001 -- any provider failure is an OcrError
-            raise OcrError(f"OCR provider call failed: {e}") from e
+            # `str(e)` is NOT safe to interpolate here: `content` above is the
+            # prompt plus the page image(s), and HTTP-client/SDK exceptions
+            # commonly echo request or response bodies in their message. Only
+            # the exception's type is reported -- that is enough to debug
+            # "what kind of failure" without risking a leaked page image or
+            # transcription. `from None` (not `from e`) so the underlying
+            # exception -- and whatever content it may carry -- never rides
+            # along in the traceback's chained cause either.
+            raise OcrError(f"OCR provider call failed: {type(e).__name__}") from None
         return response.content if isinstance(response.content, str) else str(response.content)
 
     async def classify_pages(
@@ -114,9 +135,12 @@ class GeminiOcrProvider:
             return []
         pages = ", ".join(str(i.page) for i in images)
         raw = await self._ask(f"{_CLASSIFY_PROMPT}\nأرقام الصفحات بالترتيب: {pages}", images)
-        payload = _parse_json(raw)
+        payload = _parse_json(raw, source="classify_pages")
         if not isinstance(payload, list):
-            raise OcrError("page classification did not return a list")
+            # Not raised from an active exception (no `from e`/implicit
+            # context to worry about), and the message names no document
+            # content -- explicit `from None` just documents that.
+            raise OcrError("page classification did not return a list") from None
 
         by_page = {}
         for item in payload:
@@ -147,9 +171,12 @@ class GeminiOcrProvider:
 
         async def one(image: PageImage) -> PageText:
             raw = await self._ask(_EXTRACT_PROMPT, [image])
-            payload = _parse_json(raw)
+            payload = _parse_json(raw, source=f"extract page {image.page}")
             if not isinstance(payload, dict):
-                raise OcrError(f"page {image.page}: transcription did not return an object")
+                # Content-free (page number only); explicit `from None` as above.
+                raise OcrError(
+                    f"page {image.page}: transcription did not return an object"
+                ) from None
             return PageText(
                 page=image.page,
                 text=str(payload.get("text", "")),
@@ -163,7 +190,8 @@ class GeminiOcrProvider:
         if not images:
             return {}
         prompt = _FIELDS_PROMPT.format(schema=json.dumps(schema, ensure_ascii=False, indent=2))
-        payload = _parse_json(await self._ask(prompt, images))
+        payload = _parse_json(await self._ask(prompt, images), source="extract_fields")
         if not isinstance(payload, dict):
-            raise OcrError("field extraction did not return an object")
+            # Content-free; explicit `from None` as above.
+            raise OcrError("field extraction did not return an object") from None
         return payload
