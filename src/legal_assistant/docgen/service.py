@@ -8,22 +8,69 @@ Nothing here writes legal prose. Article text reaching the document is
 verbatim OCR output, a span substitution recorded in `patch_ops`, or text
 the lawyer typed.
 
-This module currently holds only the PURE helpers (no DB, no I/O): the
-session-lifecycle orchestration (create_session, get_session, add_upload,
-run_ocr_job, update_fields, update_article, update_attendees, render_session,
-delete_session, purge_expired) is added on top of this in a follow-up.
+Every DB-touching function below is reachable only through `get_session`,
+which enforces ownership, so an authorization check never has to be repeated
+per-call. Every exception this module raises to a caller is built from a
+static Arabic message or an exception TYPE NAME ONLY -- never from
+interpolating a caught exception's own message -- because uploads, OCR
+output, and DB error details (a failing statement's bound parameters) can
+all carry a partner's national ID or passport number. See `_fail_stage`,
+`_run_stage_sync`/`_run_stage_async`, and `_safe_flush`/`_safe_commit`.
 """
 
 from __future__ import annotations
 
+import logging
 import re
-from collections.abc import Sequence
+from collections.abc import Coroutine, Sequence
+from typing import Any, NoReturn, TypeVar
 
+from sqlalchemy import func, select
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
+
+from legal_assistant.config import get_settings
+from legal_assistant.db.session import get_sessionmaker
+from legal_assistant.docgen import pdf, storage
 from legal_assistant.docgen.arabic import to_ascii_digits
-from legal_assistant.docgen.models import SourceMode, UploadKind
-from legal_assistant.docgen.parsing.commercial_register import CompanyRecord
-from legal_assistant.docgen.parsing.signatures import Concept
+from legal_assistant.docgen.models import (
+    DocgenArticle,
+    DocgenFields,
+    DocgenSession,
+    DocgenUpload,
+    SessionStatus,
+    SourceMode,
+    UploadKind,
+    default_expires_at,
+)
+from legal_assistant.docgen.numbering import article_name, ordinal_words
+from legal_assistant.docgen.ocr.base import OcrError, body_pages, get_provider
+from legal_assistant.docgen.parsing import sections
+from legal_assistant.docgen.parsing.articles import ExtractedArticle
+from legal_assistant.docgen.parsing.commercial_register import (
+    CR_FIELD_SCHEMA,
+    CompanyRecord,
+    Party,
+    parse_party_table,
+    record_from_payload,
+    split_capital,
+)
+from legal_assistant.docgen.parsing.signatures import Concept, classify, find_article
 from legal_assistant.docgen.patching import PatchResult, Replacement, patch_article
+from legal_assistant.docgen.pdf import InvalidPdfError
+from legal_assistant.docgen.render import (
+    ArticleBlock,
+    Attendee,
+    build_context,
+    render_document,
+)
+from legal_assistant.docgen.storage import StorageKeyError
+from legal_assistant.docgen.templates.registry import get_template
+
+_log = logging.getLogger(__name__)
+
+_T = TypeVar("_T")
 
 
 class SessionNotFoundError(LookupError):
@@ -219,3 +266,742 @@ def validate_source_mode(
             raise SessionStateError("الوضع المختار يتطلب رفع مستخرج السجل التجارى.")
     elif not typed_cr_no:
         raise SessionStateError("أدخل رقم السجل التجارى وتاريخ القيد.")
+
+
+def _reconcile_capital(attendees: Sequence[dict], issued_capital: str | None) -> str | None:
+    """Compare the attendee roster's declared shares against the company's
+    independently-extracted issued capital. `None` means "reconciles" (or
+    the figures are usable and agree); a returned string is an Arabic note
+    describing why the roster cannot be trusted as complete.
+
+    `compute_percentages` only ever sees the attendee list itself, so a
+    roster missing a partner -- because CR/OCR extraction failed to recover
+    them, not because they were genuinely absent -- still looks perfectly
+    self-consistent to it: `('100', '100')` for a lone 50-share attendee is
+    correct only if that IS the whole company. `issued_capital` comes from a
+    *different* extraction (the السجل التجارى Box 9, or the عقد's رأس المال
+    المصدر figure via `split_capital`), so comparing the two catches exactly
+    this class of silent under-count. This is a best-effort numeric check,
+    not proof of completeness -- it cannot catch two OCR errors that happen
+    to cancel out -- so callers must still treat "reconciles" as "no
+    detected problem", not "verified correct".
+    """
+    if not issued_capital:
+        return "لا يمكن التحقق من اكتمال كشف الحضور: رأس المال المصدر غير معروف."
+    try:
+        capital_value = float(to_ascii_digits(issued_capital).replace(",", "").replace("٬", ""))
+    except ValueError:
+        return "لا يمكن التحقق من اكتمال كشف الحضور: قيمة رأس المال المصدر غير صالحة."
+    if capital_value <= 0:
+        return "لا يمكن التحقق من اكتمال كشف الحضور: قيمة رأس المال المصدر غير صالحة."
+
+    total = 0.0
+    any_share = False
+    for person in attendees:
+        raw = person.get("shares")
+        if not raw:
+            continue
+        cleaned = (
+            to_ascii_digits(str(raw))
+            .replace(",", "")
+            .replace("%", "")
+            .replace("٪", "")
+            .replace("٬", "")
+            .strip()
+        )
+        try:
+            total += float(cleaned)
+            any_share = True
+        except ValueError:
+            continue
+
+    if not any_share:
+        return "لا يمكن التحقق من اكتمال كشف الحضور: بيانات الحصص غير معروفة."
+
+    # 1% slack for rounding noise between two independently-OCR'd figures;
+    # anything wider than that is treated as a real discrepancy.
+    tolerance = max(1.0, capital_value * 0.01)
+    if abs(total - capital_value) > tolerance:
+        return (
+            f"مجموع حصص الشركاء المذكورين فى الكشف ({total:g}) لا يتفق مع رأس المال "
+            f"المصدر للشركة ({capital_value:g}). قد يكون كشف الشركاء غير مكتمل أو "
+            "غير دقيق؛ راجعه قبل اعتماد نسبة الحضور."
+        )
+    return None
+
+
+# --- error handling plumbing ----------------------------------------------
+#
+# Every exception below can carry OCR'd document content -- InvalidPdfError
+# and StorageKeyError messages are built from this codebase's own PDF/storage
+# layers (never a raw filesystem path or document text by their own design,
+# but treated here as untrusted regardless), OcrError can wrap a transcribed
+# page or a سجل تجارى field, FileNotFoundError comes from a missing storage
+# key, and SQLAlchemyError's message can include a failing statement's bound
+# parameters (this app does not configure `hide_parameters`). None of their
+# `str()` output is ever interpolated into a message this module raises,
+# logs, or persists -- only the exception's TYPE NAME is used, and the
+# replacement exception is always constructed and raised strictly *after*
+# its try/except has exited, never from inside the `except` clause: raising
+# from inside unconditionally re-attaches the handled exception to the new
+# one's `__context__` (surviving even `from None`, which only affects
+# display), which would leave the original exception -- and its message --
+# reachable to any serializer that reads `__context__` directly. See
+# `ocr/gemini.py`'s `_ask`/`_parse_json` for the same pattern, established
+# there after two review rounds on exactly this leak class.
+
+_RISKY_ERRORS = (InvalidPdfError, StorageKeyError, FileNotFoundError, OcrError)
+
+
+class _StageError(RuntimeError):
+    """One stage of a docgen pipeline (upload, OCR, render, storage) failed.
+    Names the stage and the failing exception's type only -- see the module
+    note above. Not specific to OCR: `add_upload`, `render_session`, and
+    `delete_session` raise it too, via `_run_stage_sync`."""
+
+
+def _fail_stage(stage: str, error_type: str) -> NoReturn:
+    raise _StageError(f"فشلت مرحلة «{stage}» أثناء معالجة الملف تلقائيا ({error_type}).")
+
+
+def _run_stage_sync(stage: str, fn, /, *args: Any, **kwargs: Any) -> Any:
+    error_type: str | None = None
+    try:
+        return fn(*args, **kwargs)
+    except _RISKY_ERRORS as e:
+        error_type = type(e).__name__
+    _fail_stage(stage, error_type)  # only reached on failure; always raises
+
+
+async def _run_stage_async(stage: str, coro: Coroutine[Any, Any, _T]) -> _T:
+    error_type: str | None = None
+    try:
+        return await coro
+    except _RISKY_ERRORS as e:
+        error_type = type(e).__name__
+    _fail_stage(stage, error_type)  # only reached on failure; always raises
+
+
+async def _safe_flush(db: AsyncSession) -> None:
+    """`db.flush()`, converting a DB error into a content-free one."""
+    error_type: str | None = None
+    try:
+        await db.flush()
+    except SQLAlchemyError as e:
+        error_type = type(e).__name__
+    if error_type is not None:
+        raise SessionStateError(f"تعذر حفظ التغييرات فى قاعدة البيانات ({error_type}).") from None
+
+
+async def _safe_commit(db: AsyncSession) -> None:
+    """`db.commit()`, converting a DB error into a content-free one."""
+    error_type: str | None = None
+    try:
+        await db.commit()
+    except SQLAlchemyError as e:
+        error_type = type(e).__name__
+    if error_type is not None:
+        raise SessionStateError(f"تعذر حفظ التغييرات فى قاعدة البيانات ({error_type}).") from None
+
+
+# --- session lifecycle ------------------------------------------------------
+
+
+async def create_session(
+    db: AsyncSession, user_id: int, company_type: str, source_mode: str
+) -> DocgenSession:
+    """Create a draft session.
+
+    Validates the company type and the source mode BEFORE constructing
+    anything that depends on them: `validate_source_mode` only checks that a
+    session's *uploads* satisfy its declared mode, it never checks that the
+    mode string itself is one of the two the app knows about -- that check
+    is this function's job, and it runs first.
+    """
+    get_template(company_type)  # raises KeyError on an unknown company type
+    if source_mode not in {m.value for m in SourceMode}:
+        raise SessionStateError(f"unknown source mode: {source_mode}")
+
+    settings = get_settings()
+    session = DocgenSession(
+        user_id=user_id,
+        company_type=company_type,
+        source_mode=source_mode,
+        status=SessionStatus.draft.value,
+        # The 2-day retention window is a deliberate, user-mandated ceiling
+        # (uploaded documents carry partners' national ID and passport
+        # numbers) that a 30-day proposal was explicitly rejected in favour
+        # of. `default_expires_at` takes the window as a parameter and the
+        # column has no server-side default, so THIS call site is the only
+        # place that window is enforced. `docgen_retention_days` defaults to
+        # 2 in `Settings` and is documented in `.env.example`; nothing else
+        # in this module may compute or override `expires_at`.
+        expires_at=default_expires_at(settings.docgen_retention_days),
+    )
+    db.add(session)
+    await _safe_flush(db)
+    db.add(DocgenFields(session_id=session.id, data={}))
+    await _safe_flush(db)
+    return session
+
+
+async def get_session(db: AsyncSession, session_id: int, user_id: int) -> DocgenSession:
+    """Load a session the caller owns.
+
+    Raises the IDENTICAL `SessionNotFoundError` whether the session does not
+    exist, has expired, or belongs to another user -- ownership is enforced
+    directly in the query's WHERE clause (not checked afterwards), so a
+    caller can never distinguish "no such id" from "not yours" by probing.
+    This is the sole authorization gate: every other function in this module
+    takes an already-loaded `DocgenSession`, so it is reachable only through
+    a session this function returned.
+    """
+    result = await db.execute(
+        select(DocgenSession)
+        .where(DocgenSession.id == session_id, DocgenSession.user_id == user_id)
+        .options(
+            selectinload(DocgenSession.articles),
+            selectinload(DocgenSession.uploads),
+            selectinload(DocgenSession.fields),
+        )
+    )
+    session = result.scalar_one_or_none()
+    if session is None or session.status == SessionStatus.expired.value:
+        raise SessionNotFoundError(f"docgen session {session_id} not found")
+    return session
+
+
+async def add_upload(
+    db: AsyncSession, session: DocgenSession, kind: str, filename: str, data: bytes
+) -> DocgenUpload:
+    """Store an uploaded PDF and record it. Does not start OCR."""
+    if kind not in {k.value for k in UploadKind}:
+        raise SessionStateError(f"unknown upload kind: {kind}")
+    if session.status == SessionStatus.ocr_running.value:
+        raise SessionStateError("جارٍ تحليل الملف الحالى، انتظر حتى ينتهى.")
+
+    count = _run_stage_sync("قراءة عدد صفحات الملف", pdf.page_count, data)
+    key = storage.new_key(session.id, kind)
+    _run_stage_sync("حفظ الملف المرفوع", storage.write, key, data)
+
+    upload = DocgenUpload(
+        session_id=session.id, kind=kind, filename=filename, storage_key=key, page_count=count
+    )
+    db.add(upload)
+    # Any edit invalidates a previously rendered document; a fresh upload is
+    # no exception, and also lets the lawyer re-run OCR after replacing a
+    # bad scan without a stale .docx staying downloadable.
+    session.document_key = None
+    if session.status == SessionStatus.rendered.value:
+        session.status = SessionStatus.ready.value
+    await _safe_flush(db)
+    return upload
+
+
+async def run_ocr_job(session_id: int) -> None:
+    """Background entry point: classify, OCR, segment, extract, patch.
+
+    Opens its OWN database session -- the request that queued this job has
+    already returned and its session is closed. Every failure path lands the
+    session in `failed` with a content-free Arabic message (see the module
+    note on error handling); uploads are kept so the lawyer can retry
+    without re-uploading.
+    """
+    sessionmaker = get_sessionmaker()
+    async with sessionmaker() as db:
+        result = await db.execute(
+            select(DocgenSession)
+            .where(DocgenSession.id == session_id)
+            .options(selectinload(DocgenSession.uploads), selectinload(DocgenSession.fields))
+        )
+        session = result.scalar_one_or_none()
+        if session is None:
+            _log.warning("docgen OCR job for missing session %s", session_id)
+            return
+
+        session.status = SessionStatus.ocr_running.value
+        session.error = None
+        await _safe_commit(db)
+
+    try:
+        await _run_ocr(session_id)
+    except Exception as e:  # noqa: BLE001 -- a background job must never escape
+        # Deliberately NOT `_log.exception(e)`/`exc_info=True`: the standard
+        # traceback formatter renders the exception's own `str()` (and walks
+        # its `__context__`/`__cause__` chain), which for an un-wrapped bug
+        # could still surface document content. Only the TYPE is logged.
+        # `OcrError`/`_StageError`/`SessionStateError` messages raised
+        # anywhere in this module are content-free by construction (static
+        # Arabic text or a type name only -- never an interpolated message),
+        # so they alone are safe to persist verbatim; anything else is a
+        # genuinely unexpected failure and gets a type-only message instead.
+        if isinstance(e, OcrError | SessionStateError | _StageError):
+            message = str(e)
+        else:
+            message = f"حدث خطأ غير متوقع أثناء معالجة الملف ({type(e).__name__})."
+        _log.error(
+            "docgen OCR job failed for session %s: %s", session_id, type(e).__name__
+        )
+        async with sessionmaker() as db:
+            session = await db.get(DocgenSession, session_id)
+            if session is not None:
+                session.status = SessionStatus.failed.value
+                session.error = message
+                await db.commit()
+
+
+async def _run_ocr(session_id: int) -> None:
+    settings = get_settings()
+    provider = get_provider(settings)
+    sessionmaker = get_sessionmaker()
+
+    async with sessionmaker() as db:
+        result = await db.execute(
+            select(DocgenSession)
+            .where(DocgenSession.id == session_id)
+            .options(selectinload(DocgenSession.uploads), selectinload(DocgenSession.fields))
+        )
+        session = result.scalar_one()
+        uploads = {u.kind: u for u in session.uploads}
+        company_type = session.company_type
+        source_mode = session.source_mode
+
+    aoa = uploads.get(UploadKind.aoa.value)
+    if aoa is None:
+        raise SessionStateError("لم يتم رفع عقد التأسيس.")
+
+    # 1. Cheap classification pass over every page.
+    aoa_bytes = _run_stage_sync("قراءة عقد التأسيس المرفوع", storage.read, aoa.storage_key)
+    thumbnails = _run_stage_sync(
+        "تجهيز صفحات المعاينة", pdf.render_pages, aoa_bytes, dpi=settings.docgen_classify_dpi
+    )
+    classifications = await _run_stage_async(
+        "تصنيف صفحات الملف", provider.classify_pages(thumbnails)
+    )
+    wanted = body_pages(classifications)
+    if not wanted:
+        raise OcrError("لم يتم التعرف على عقد تأسيس داخل هذا الملف.")
+
+    # 2. Full-fidelity OCR on body pages only.
+    pages = _run_stage_sync(
+        "تجهيز صفحات العقد للتعرف الضوئى",
+        pdf.render_pages,
+        aoa_bytes,
+        dpi=settings.docgen_ocr_dpi,
+        pages=wanted,
+    )
+    page_texts = await _run_stage_async("التعرف الضوئى على نص العقد", provider.extract(pages))
+    full_text = "\n".join(p.text for p in page_texts)
+    page_confidence = (
+        sum(p.confidence for p in page_texts) / len(page_texts) if page_texts else 0.0
+    )
+
+    # 3. Instrument split, then article segmentation on the right series.
+    instruments = sections.split_instruments(full_text)
+    articles, warning = sections.select_target(instruments, company_type)
+    if not articles:
+        # A session with zero articles can never be rendered (render_session
+        # already fails closed via NothingSelectedError once there is at
+        # least a `selected` flag to check, but there is nothing here for
+        # the lawyer to select at all) -- land the job in `failed`, not
+        # `ready`, so this is never mistaken for a completed-but-empty
+        # session. `warning` is a static, content-free message authored by
+        # `sections.select_target` itself.
+        raise OcrError(warning or "لم يتم العثور على مواد قابلة للتعديل داخل الملف.")
+
+    # 4. Identity fields.
+    record, provenance = await _run_stage_async(
+        "استخراج بيانات هوية الشركة",
+        _extract_fields(provider, source_mode, uploads, articles, settings),
+    )
+
+    # 5. Patch and persist.
+    async with sessionmaker() as db:
+        session = await db.get(DocgenSession, session_id)
+        aoa_row = await db.get(DocgenUpload, aoa.id)
+        aoa_row.page_classification = [
+            {
+                "page": c.page,
+                "kind": c.kind.value,
+                "starts_article": c.starts_article,
+                "confidence": c.confidence,
+            }
+            for c in classifications
+        ]
+
+        await db.execute(
+            DocgenArticle.__table__.delete().where(DocgenArticle.session_id == session_id)
+        )
+        for article in articles:
+            db.add(_build_article_row(session_id, article, record, source_mode, page_confidence))
+
+        fields_row = await db.scalar(
+            select(DocgenFields).where(DocgenFields.session_id == session_id)
+        )
+        fields_row.data = provenance
+
+        session.status = SessionStatus.ready.value
+        session.error = warning
+        await _safe_commit(db)
+
+
+def _build_article_row(
+    session_id: int,
+    article: ExtractedArticle,
+    record: CompanyRecord,
+    source_mode: str,
+    confidence: float,
+) -> DocgenArticle:
+    concept = classify(article)
+    if source_mode == SourceMode.aoa_plus_cr.value:
+        result = apply_patches(article.body, plan_patches(record, concept, article.body))
+    else:
+        # aoa_only: the عقد has never been amended, so its text is already
+        # current. Patching is a declared no-op, not a silent skip.
+        result = apply_patches(article.body, [])
+
+    return DocgenArticle(
+        session_id=session_id,
+        article_number=article.number,
+        ordinal_words=ordinal_words(article.number)
+        if 1 <= article.number <= 99
+        else str(article.number),
+        source_text=article.body,
+        patched_text=result.text,
+        patch_ops=[
+            {
+                "start": op.start,
+                "end": op.end,
+                "old": op.old,
+                "new": op.new,
+                "field": op.field,
+                "source": op.source,
+            }
+            for op in result.ops
+        ],
+        confidence=confidence,
+        needs_review=result.needs_review,
+        selected=False,
+    )
+
+
+async def _extract_fields(
+    provider, source_mode: str, uploads: dict, articles: Sequence[ExtractedArticle], settings
+) -> tuple[CompanyRecord, dict]:
+    """Build the CompanyRecord and its provenance map.
+
+    In `aoa_plus_cr` the سجل wins as the PROPOSED value, but a disagreement
+    with the عقد is recorded in `conflict` and surfaced -- never silently
+    resolved. The attendee roster built here also gets a capital
+    reconciliation note (see `_reconcile_capital`) recorded alongside it, so
+    the review screen can show it before the lawyer ever attempts a render;
+    `render_session` recomputes the same check against the roster as it
+    stands at render time, since edits since extraction can change the
+    answer.
+    """
+    from_aoa = _record_from_articles(articles)
+
+    from_cr = CompanyRecord()
+    if source_mode == SourceMode.aoa_plus_cr.value:
+        cr = uploads.get(UploadKind.commercial_register.value)
+        if cr is not None:
+            cr_bytes = _run_stage_sync(
+                "قراءة مستخرج السجل التجارى المرفوع", storage.read, cr.storage_key
+            )
+            images = _run_stage_sync(
+                "تجهيز صفحات مستخرج السجل التجارى",
+                pdf.render_pages,
+                cr_bytes,
+                dpi=settings.docgen_ocr_dpi,
+            )
+            payload = await provider.extract_fields(images, CR_FIELD_SCHEMA)
+            from_cr = record_from_payload(payload)
+
+    provenance: dict = {}
+    for name in (
+        "commercial_registration_no",
+        "commercial_registration_date",
+        "company_name",
+        "law_number",
+        "law_year",
+        "company_address",
+        "capital",
+        "issued_capital",
+    ):
+        cr_value = getattr(from_cr, name)
+        aoa_value = getattr(from_aoa, name)
+        value = cr_value or aoa_value
+        conflict = None
+        if cr_value and aoa_value and cr_value != aoa_value:
+            conflict = {"cr": cr_value, "aoa": aoa_value}
+        provenance[name] = {
+            "value": value,
+            "source": "cr" if cr_value else ("aoa" if aoa_value else "user"),
+            "confidence": 1.0 if value else 0.0,
+            "conflict": conflict,
+        }
+
+    # Box (9) is authoritative when populated; the عقد's share table is the
+    # fallback. Where neither states holdings, names still prefill and the
+    # review screen asks the lawyer for the numbers.
+    parties = from_cr.parties or from_aoa.parties
+    attendees = [
+        {
+            "name": p.name,
+            "shares": p.shares,
+            "percentage": p.percentage,
+            "attending": True,
+            "source": "cr" if from_cr.parties else "aoa",
+        }
+        for p in parties
+    ]
+    provenance["attendees"] = attendees
+    # Surfaced, never silently trusted: a roster that looks internally
+    # consistent (its shares sum to something) is not the same as a roster
+    # that is COMPLETE. See `_reconcile_capital`.
+    provenance["capital_reconciliation"] = _reconcile_capital(
+        attendees, provenance["issued_capital"]["value"]
+    )
+
+    merged = CompanyRecord(
+        **{
+            name: provenance[name]["value"]
+            for name in provenance
+            if name not in ("attendees", "capital_reconciliation")
+        },
+        parties=list(parties),
+    )
+    return merged, provenance
+
+
+def _record_from_articles(articles: Sequence[ExtractedArticle]) -> CompanyRecord:
+    """Everything the عقد itself states, used as fallback and as the conflict side."""
+    name_article = find_article(articles, Concept.COMPANY_NAME)
+    office = find_article(articles, Concept.HEAD_OFFICE)
+    capital = find_article(articles, Concept.CAPITAL)
+    parties: list[Party] = parse_party_table(capital.body) if capital else []
+    # مساهمة states رأس المال المرخص به and رأس المال المصدر separately; the
+    # quorum is computed from المصدر, so the two are kept apart from here on.
+    _authorized, issued = split_capital(capital.body) if capital else (None, None)
+    return CompanyRecord(
+        company_name=_current_value("company_name", name_article.body) or None
+        if name_article
+        else None,
+        company_address=_current_value("company_address", office.body) or None
+        if office
+        else None,
+        capital=_current_value("capital", capital.body) or None if capital else None,
+        issued_capital=issued,
+        parties=parties,
+    )
+
+
+# --- review edits -----------------------------------------------------------
+
+
+def _invalidate_document(session: DocgenSession) -> None:
+    """Any edit makes a previously rendered document stale."""
+    session.document_key = None
+    if session.status == SessionStatus.rendered.value:
+        session.status = SessionStatus.ready.value
+
+
+async def update_fields(db: AsyncSession, session: DocgenSession, changes: dict) -> None:
+    """Apply lawyer corrections to identity fields, marking them user-sourced."""
+    row = await db.scalar(select(DocgenFields).where(DocgenFields.session_id == session.id))
+    data = dict(row.data or {})
+    for name, value in changes.items():
+        entry = dict(data.get(name) or {})
+        entry.update({"value": value, "source": "user", "confidence": 1.0, "conflict": None})
+        data[name] = entry
+    row.data = data
+    _invalidate_document(session)
+    await _safe_flush(db)
+
+
+async def update_article(
+    db: AsyncSession,
+    session: DocgenSession,
+    article_number: int,
+    *,
+    selected: bool | None = None,
+    patched_text: str | None = None,
+    new_text: str | None = None,
+) -> DocgenArticle:
+    """Select an article, correct its "قبل التعديل", or write its "بعد التعديل".
+
+    `source_text` is never touched, so the verbatim OCR output stays
+    auditable next to whatever the lawyer changed.
+    """
+    article = await db.scalar(
+        select(DocgenArticle).where(
+            DocgenArticle.session_id == session.id,
+            DocgenArticle.article_number == article_number,
+        )
+    )
+    if article is None:
+        raise SessionNotFoundError(f"article {article_number} is not in this session")
+    if selected is not None:
+        article.selected = selected
+    if patched_text is not None:
+        article.patched_text = patched_text
+        article.needs_review = False
+    if new_text is not None:
+        article.new_text = new_text
+    _invalidate_document(session)
+    await _safe_flush(db)
+    return article
+
+
+async def update_attendees(
+    db: AsyncSession, session: DocgenSession, attendees: list[dict]
+) -> None:
+    """Replace the attendee roster and refresh its capital reconciliation.
+
+    The reconciliation note is recomputed here (not just at OCR-extraction
+    time) because this is exactly where the roster the lawyer is looking at
+    can change -- adding a missed partner, correcting a share figure -- and a
+    stale "mismatch" or, worse, a stale "reconciles" left over from before
+    the edit would defeat the whole point of the check.
+    """
+    row = await db.scalar(select(DocgenFields).where(DocgenFields.session_id == session.id))
+    data = dict(row.data or {})
+    data["attendees"] = attendees
+    issued_capital = ((data.get("issued_capital") or {}).get("value")) or None
+    data["capital_reconciliation"] = _reconcile_capital(attendees, issued_capital)
+    row.data = data
+    _invalidate_document(session)
+    await _safe_flush(db)
+
+
+# --- render ------------------------------------------------------------------
+
+
+async def render_session(db: AsyncSession, session: DocgenSession) -> bytes:
+    """Render the document. Idempotent and re-runnable.
+
+    Fails closed rather than emit a partially-complete instrument:
+    - no article selected -> `NothingSelectedError`;
+    - a selected article with no "بعد التعديل" text yet -> `SessionStateError`
+      naming it;
+    - for a company type with an attendance table, a roster that does not
+      reconcile against the issued capital -> `SessionStateError` (a wrong
+      quorum percentage in a محضر جمعية عامة is a legal defect in the filed
+      instrument, not a cosmetic one -- see `_reconcile_capital`);
+    - any placeholder `render_document` cannot fill -> `MissingContextError`
+      (raised by `render_document` itself; not caught or papered over here).
+    """
+    articles = [a for a in session.articles if a.selected]
+    if not articles:
+        raise NothingSelectedError("اختر مادة واحدة على الأقل للتعديل.")
+    missing = [a.article_number for a in articles if not (a.new_text or "").strip()]
+    if missing:
+        raise SessionStateError(f"اكتب نص «بعد التعديل» للمواد: {missing}")
+
+    row = await db.scalar(select(DocgenFields).where(DocgenFields.session_id == session.id))
+    data = row.data or {}
+    scalars = {
+        name: (entry or {}).get("value") or ""
+        for name, entry in data.items()
+        if name not in ("attendees", "capital_reconciliation")
+    }
+
+    spec = get_template(session.company_type)
+    attendees_data = data.get("attendees", [])
+    attendee_rows = [p for p in attendees_data if p.get("attending", True)]
+    if spec.attendee_label:
+        issued_capital = ((data.get("issued_capital") or {}).get("value")) or None
+        mismatch = _reconcile_capital(attendees_data, issued_capital)
+        if mismatch is not None:
+            raise SessionStateError(mismatch)
+        attendance, approval = compute_percentages(attendees_data)
+        scalars.setdefault("attendance_percentage", attendance or "")
+        scalars.setdefault("approval_percentage", approval or "")
+
+    context = build_context(
+        session.company_type,
+        scalars=scalars,
+        articles=[
+            ArticleBlock(
+                article_name=article_name(a.article_number),
+                article_original_content=a.patched_text,
+                article_new_content=a.new_text or "",
+            )
+            for a in articles
+        ],
+        article_numbers=[a.article_number for a in articles],
+        attendees=[
+            Attendee(
+                name=p.get("name", ""),
+                shares=str(p.get("shares") or ""),
+                percentage=str(p.get("percentage") or ""),
+            )
+            for p in attendee_rows
+        ],
+    )
+
+    document = render_document(session.company_type, context)
+    key = storage.new_key(session.id, "document")
+    _run_stage_sync("حفظ المستند الناتج", storage.write, key, document)
+    session.document_key = key
+    session.status = SessionStatus.rendered.value
+    await _safe_flush(db)
+    return document
+
+
+# --- deletion and retention ---------------------------------------------------
+
+
+async def delete_session(db: AsyncSession, session: DocgenSession) -> None:
+    """Delete the session row and every file stored for it, now."""
+    _run_stage_sync("حذف ملفات الجلسة", storage.delete_session, session.id)
+    await db.delete(session)
+    await _safe_flush(db)
+
+
+async def purge_expired(db: AsyncSession) -> int:
+    """Purge every expired session's files and text. Returns how many.
+
+    The session ROW survives in `expired` form for audit; the uploads, the
+    OCR text, and the article text -- which carry national ID and passport
+    numbers -- do not. Storage deletion is attempted best-effort per session:
+    a `StorageKeyError` on one session's files is logged (type only, see the
+    module note on error handling) and that session is skipped for this
+    pass -- rather than aborting the whole purge, or than marking it purged
+    when its files might still be sitting on disk -- and it remains eligible
+    to be retried on the next call.
+    """
+    result = await db.execute(
+        select(DocgenSession).where(
+            DocgenSession.expires_at < func.now(),
+            DocgenSession.status != SessionStatus.expired.value,
+        )
+    )
+    sessions = list(result.scalars())
+    purged = 0
+    for session in sessions:
+        try:
+            storage.delete_session(session.id)
+        except StorageKeyError as e:
+            _log.error(
+                "docgen purge: could not delete stored files for session %s: %s",
+                session.id,
+                type(e).__name__,
+            )
+            continue
+        await db.execute(
+            DocgenArticle.__table__.delete().where(DocgenArticle.session_id == session.id)
+        )
+        await db.execute(
+            DocgenUpload.__table__.delete().where(DocgenUpload.session_id == session.id)
+        )
+        await db.execute(
+            DocgenFields.__table__.update()
+            .where(DocgenFields.session_id == session.id)
+            .values(data={})
+        )
+        session.status = SessionStatus.expired.value
+        session.document_key = None
+        purged += 1
+    await _safe_flush(db)
+    return purged

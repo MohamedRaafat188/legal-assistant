@@ -5,6 +5,7 @@ from legal_assistant.docgen.parsing.signatures import Concept
 from legal_assistant.docgen.patching import Replacement
 from legal_assistant.docgen.service import (
     SessionStateError,
+    _reconcile_capital,
     apply_patches,
     compute_percentages,
     plan_patches,
@@ -170,6 +171,43 @@ def test_compute_percentages_strips_an_arabic_percent_sign_before_parsing():
 def test_compute_percentages_strips_the_arabic_thousands_separator():
     attendees = [{"name": "أ", "shares": "١٠٠٬٠٠٠", "attending": True}]
     assert compute_percentages(attendees) == ("100", "100")
+
+
+def test_reconcile_capital_accepts_a_roster_that_sums_to_the_issued_capital():
+    attendees = [{"shares": "60"}, {"shares": "40"}]
+    assert _reconcile_capital(attendees, "100") is None
+
+
+def test_reconcile_capital_flags_a_roster_missing_a_partner():
+    # A lone 50-share attendee looks perfectly self-consistent to
+    # compute_percentages, but is silently wrong if the company's issued
+    # capital is actually 100 -- some partner's holding never made it into
+    # the roster (an OCR/extraction miss, not a real absence).
+    note = _reconcile_capital([{"shares": "50"}], "100")
+    assert note is not None
+    assert "50" in note and "100" in note
+
+
+def test_reconcile_capital_is_unknown_when_issued_capital_is_missing():
+    note = _reconcile_capital([{"shares": "100"}], None)
+    assert note is not None
+
+
+def test_reconcile_capital_is_unknown_when_no_share_is_usable():
+    note = _reconcile_capital([{"name": "أ"}], "100")
+    assert note is not None
+
+
+def test_reconcile_capital_tolerates_percent_signs_and_separators():
+    attendees = [{"shares": "60%"}, {"shares": "40%"}]
+    assert _reconcile_capital(attendees, "١٠٠") is None
+
+
+def test_reconcile_capital_allows_small_rounding_slack():
+    # Two independently-OCR'd figures may differ by a rounding hair; only a
+    # gap wider than ~1% is treated as a real discrepancy.
+    attendees = [{"shares": "99.6"}]
+    assert _reconcile_capital(attendees, "100") is None
 
 
 def test_validate_source_mode_requires_a_cr_upload_in_aoa_plus_cr_mode():
