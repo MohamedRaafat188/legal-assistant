@@ -179,6 +179,7 @@ Langfuse tracing wraps the system as a best-effort, non-blocking layer — every
 - `Settings.database_url` normalizes `postgres://`/`postgresql://` connection strings to `postgresql+asyncpg://` automatically for compatibility with Railway's managed connection string.
 - All dependencies are pinned to exact versions in `pyproject.toml` for reproducible builds.
 - Secrets live only in `.env` (git-ignored) locally and in Railway's environment variables in production; every secret is rotated before being placed into the production environment, rather than reusing development-time values.
+- **docgen retention purge:** `python scripts/docgen_purge.py` must be configured as a **daily Railway cron job**. It wraps `docgen.service.purge_expired`, which deletes uploads, OCR text, and article text for docgen sessions past their `docgen_retention_days` (2-day) window; uploaded عقد تأسيس documents carry partners' national ID and passport numbers, so skipping this job means that data is retained past its stated retention window instead of being deleted on schedule.
 
 ### Environment configuration
 
