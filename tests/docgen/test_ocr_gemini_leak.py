@@ -60,19 +60,57 @@ def _provider(fake_llm) -> GeminiOcrProvider:
     return provider
 
 
+_CHAIN_LINK_ATTRS = {"__cause__", "__context__", "__traceback__", "__suppress_context__"}
+
+
+def _walk_exception_chain(exc: BaseException) -> list[BaseException]:
+    """Every exception reachable from `exc` via `__cause__` or `__context__`,
+    recursively, deduplicated by identity. This is what a naive exception
+    walker or structured log serializer (e.g. one that emits `__cause__` and
+    `__context__` as nested records, or dumps `vars(exc)`) would traverse --
+    `from None` on its own only makes `str()`/`repr()`/`traceback.format_*`
+    look clean by setting `__suppress_context__`; it does not detach
+    `__context__` itself, so a serializer reading that attribute directly
+    still walks into it.
+    """
+    seen: set[int] = set()
+    chain: list[BaseException] = []
+    stack = [exc]
+    while stack:
+        current = stack.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        chain.append(current)
+        if current.__cause__ is not None:
+            stack.append(current.__cause__)
+        if current.__context__ is not None:
+            stack.append(current.__context__)
+    return chain
+
+
 def _assert_sensitive_absent(exc: Exception, sensitive: str) -> None:
-    """The core assertion: `sensitive` must appear in NONE of: str(exc),
-    repr(exc), str(exc.__cause__), repr(exc.__cause__), or the fully
-    formatted traceback (which is what a log handler like Sentry's actually
-    captures)."""
-    assert sensitive not in str(exc)
-    assert sensitive not in repr(exc)
-    if exc.__cause__ is not None:
-        assert sensitive not in str(exc.__cause__)
-        assert sensitive not in repr(exc.__cause__)
-    formatted = "".join(
-        traceback.format_exception(type(exc), exc, exc.__traceback__)
-    )
+    """The core assertion: `sensitive` must appear NOWHERE in the full
+    exception graph -- not in `str()`/`repr()` of any exception in the chain
+    (walking both `__cause__` and `__context__`, recursively), not in any
+    exception's `.args`, not in any other instance attribute an exception
+    happens to carry (e.g. `JSONDecodeError.doc`, which holds the complete
+    un-parsed raw text and survives `from None` unless `__context__` is
+    explicitly cleared), and not in the traceback as formatted by
+    `traceback.format_exception` (what most log handlers actually capture).
+    """
+    for link in _walk_exception_chain(exc):
+        assert sensitive not in str(link), f"leaked via str() of {type(link).__name__}"
+        assert sensitive not in repr(link), f"leaked via repr() of {type(link).__name__}"
+        for arg in link.args:
+            assert sensitive not in str(arg), f"leaked via .args of {type(link).__name__}"
+        for attr_name, attr_value in vars(link).items():
+            if attr_name in _CHAIN_LINK_ATTRS:
+                continue
+            assert sensitive not in str(attr_value), (
+                f"leaked via .{attr_name} of {type(link).__name__}"
+            )
+    formatted = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
     assert sensitive not in formatted
 
 
@@ -177,22 +215,59 @@ def test_ask_failure_message_still_names_the_exception_type():
     assert "RuntimeError" in str(excinfo.value)
 
 
-def test_json_decode_error_cause_is_suppressed_not_chained():
-    """`from None` on the _parse_json raise site: the JSONDecodeError (whose
-    `.doc` attribute holds the full raw text) must not become `__cause__`."""
+def test_json_decode_error_is_fully_detached_not_just_suppressed():
+    """`_parse_json`'s raise site: `from None` alone clears `__cause__` and
+    sets `__suppress_context__`, which is enough to make `str()`/`repr()`/
+    `traceback.format_exception` look clean -- but does NOT clear
+    `__context__`. Without the explicit `error.__context__ = None`, the
+    JSONDecodeError (whose `.doc` attribute holds the full raw text,
+    including the synthetic ID) remains reachable via `__context__` for any
+    serializer that reads it directly. This assertion is non-vacuous against
+    the pre-fix code: before the fix, `__context__` here was the
+    JSONDecodeError instance, not None.
+    """
     provider = _provider(_FakeLlmReturns(f"not json {SENSITIVE_TEXT}"))
     with pytest.raises(OcrError) as excinfo:
         asyncio.run(provider.classify_pages(_IMAGES))
     assert excinfo.value.__cause__ is None
-    assert excinfo.value.__suppress_context__ is True
+    assert excinfo.value.__context__ is None
+    # `__context__` is unset because the raise happens outside the `except`
+    # block entirely (see gemini.py), not because it was suppressed while
+    # still attached -- so `__suppress_context__` has nothing to suppress
+    # and is correctly False here. What matters is `__context__ is None`.
+    assert excinfo.value.__suppress_context__ is False
 
 
-def test_ask_exception_cause_is_suppressed_not_chained():
+def test_ask_exception_is_fully_detached_not_just_suppressed():
+    """`_ask`'s catch-all raise site: same requirement as above. Non-vacuous
+    against the pre-fix code: before the fix, `__context__` here was the
+    caught `RuntimeError` instance (carrying the synthetic ID in `.args`),
+    not None.
+    """
     provider = _provider(_FakeLlmRaises(RuntimeError(f"body: {SENSITIVE_TEXT}")))
     with pytest.raises(OcrError) as excinfo:
         asyncio.run(provider.classify_pages(_IMAGES))
     assert excinfo.value.__cause__ is None
-    assert excinfo.value.__suppress_context__ is True
+    assert excinfo.value.__context__ is None
+    assert excinfo.value.__suppress_context__ is False
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [_wrong_shape_classify, _wrong_shape_extract, _wrong_shape_extract_fields],
+)
+def test_content_free_raise_sites_have_no_context_either(factory):
+    """The three shape-check raise sites (classify_pages/extract/
+    extract_fields "did not return a list/object") are never reached from
+    inside an active `except` block -- they only run after `_parse_json`
+    returns successfully -- so `__context__` is naturally `None` with no
+    explicit clearing needed. Confirmed here rather than merely asserted in
+    prose.
+    """
+    with pytest.raises(OcrError) as excinfo:
+        asyncio.run(factory())
+    assert excinfo.value.__cause__ is None
+    assert excinfo.value.__context__ is None
 
 
 # --- Finding 3: dataclass reprs ---------------------------------------------

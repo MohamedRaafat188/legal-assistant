@@ -86,22 +86,34 @@ def _parse_json(raw: str, *, source: str) -> object:
     on failure only the call site (`source`), the response length, and the
     parser's own (content-free) error position are reported.
 
-    Chained `from None`: `json.JSONDecodeError.__str__` is just a position,
-    but the exception object also carries the full un-parsed text on its
-    `.doc` attribute, which a structured log formatter that serializes
-    exception attributes (not just `str(exc)`) would emit. Suppressing the
-    cause is the only way to guarantee that attribute never reaches a log.
+    `json.JSONDecodeError.__str__` is just a position, but the exception
+    object also carries the full un-parsed text on its `.doc` attribute,
+    which a structured log formatter that serializes exception attributes
+    (not just `str(exc)`) would emit. `raise ... from None` is NOT enough to
+    stop that: it clears `__cause__` and sets `__suppress_context__ = True`
+    (which is what makes `str()`/`repr()`/`traceback.format_exception()`
+    look clean), but it does not clear `__context__` -- and raising from
+    inside an `except` block makes the interpreter unconditionally overwrite
+    the new exception's `__context__` with the exception currently being
+    handled, clobbering even a manual `error.__context__ = None` assigned in
+    the same block. The only reliable way to keep `__context__` unset is to
+    construct and raise the new error *after* the `try`/`except` statement
+    has finished, once this frame is no longer "handling" the
+    `JSONDecodeError` -- which is exactly what happens below.
     """
     text = raw.strip()
     if text.startswith("```"):
         text = text.split("\n", 1)[1].rsplit("```", 1)[0]
+    parse_error_position: int | None = None
     try:
         return json.loads(text)
     except json.JSONDecodeError as e:
-        raise OcrError(
-            f"OCR provider ({source}) returned a response that is not valid JSON "
-            f"(length={len(raw)} chars, parse error at character {e.pos})"
-        ) from None
+        parse_error_position = e.pos
+    # Deliberately outside the `except` block -- see the docstring above.
+    raise OcrError(
+        f"OCR provider ({source}) returned a response that is not valid JSON "
+        f"(length={len(raw)} chars, parse error at character {parse_error_position})"
+    )
 
 
 class GeminiOcrProvider:
@@ -114,18 +126,31 @@ class GeminiOcrProvider:
     async def _ask(self, prompt: str, images: Sequence[PageImage]) -> str:
         content: list[dict] = [{"type": "text", "text": prompt}]
         content.extend(_image_part(i) for i in images)
+        # `str(e)` is NOT safe to interpolate into the error message below:
+        # `content` above is the prompt plus the page image(s), and
+        # HTTP-client/SDK exceptions commonly echo request or response
+        # bodies in their message. Only the exception's type name is kept.
+        #
+        # The `raise` itself is deliberately placed AFTER this try/except
+        # statement, not inside the `except` clause. Raising from inside an
+        # `except` block makes the interpreter unconditionally set the new
+        # exception's `__context__` to the exception being handled -- even
+        # if `__context__` is assigned `None` by hand first, and even with
+        # `from None` (which only clears `__cause__`/sets
+        # `__suppress_context__ = True`, not `__context__`). That would
+        # leave `e` -- and whatever request/response content it carries in
+        # `.args` or elsewhere -- reachable via `OcrError.__context__` for
+        # any serializer that reads that attribute directly. Raising after
+        # the `except` block has already exited avoids that: this frame is
+        # no longer "handling" `e` by the time the new exception is raised,
+        # so `__context__` stays unset.
+        error_type_name: str | None = None
         try:
             response = await self._llm.ainvoke([{"role": "user", "content": content}])
         except Exception as e:  # noqa: BLE001 -- any provider failure is an OcrError
-            # `str(e)` is NOT safe to interpolate here: `content` above is the
-            # prompt plus the page image(s), and HTTP-client/SDK exceptions
-            # commonly echo request or response bodies in their message. Only
-            # the exception's type is reported -- that is enough to debug
-            # "what kind of failure" without risking a leaked page image or
-            # transcription. `from None` (not `from e`) so the underlying
-            # exception -- and whatever content it may carry -- never rides
-            # along in the traceback's chained cause either.
-            raise OcrError(f"OCR provider call failed: {type(e).__name__}") from None
+            error_type_name = type(e).__name__
+        if error_type_name is not None:
+            raise OcrError(f"OCR provider call failed: {error_type_name}")
         return response.content if isinstance(response.content, str) else str(response.content)
 
     async def classify_pages(
