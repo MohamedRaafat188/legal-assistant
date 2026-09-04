@@ -77,6 +77,36 @@ def _image_part(image: PageImage) -> dict:
     return {"type": "image_url", "image_url": f"data:image/png;base64,{encoded}"}
 
 
+def _text_of(content: object) -> str:
+    """Extract the plain text of an `AIMessage.content`.
+
+    Gemini 3-generation models return `content` as a list of content blocks
+    (each `{"type": "text", "text": "...", "extras": {...}}`, the "extras"
+    carrying an opaque thought-signature token), not a bare string the way
+    earlier Gemini models did -- `AIMessage.content`'s declared type has
+    always been `str | list[str | dict]`, this call site just never
+    exercised the list branch until a live Gemini 3 model did. The previous
+    fallback, `str(response.content)`, stringified the whole Python list
+    (thought-signature blob included) instead of the transcription text,
+    which fed something like `[{'type': 'text', 'text': '...', ...}]` into
+    `_parse_json` and made every OCR call fail. Only `type == "text"` blocks
+    are kept; any other block type (e.g. a future "thinking" block) is
+    silently skipped rather than concatenated in, since only rendered text
+    is ever meaningful to `_parse_json`'s caller.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict) and block.get("type") == "text":
+                parts.append(str(block.get("text", "")))
+        return "".join(parts)
+    return str(content)
+
+
 def _parse_json(raw: str, *, source: str) -> object:
     """Parse a model response that may be wrapped in a ```json fence.
 
@@ -151,7 +181,7 @@ class GeminiOcrProvider:
             error_type_name = type(e).__name__
         if error_type_name is not None:
             raise OcrError(f"OCR provider call failed: {error_type_name}")
-        return response.content if isinstance(response.content, str) else str(response.content)
+        return _text_of(response.content)
 
     async def classify_pages(
         self, images: Sequence[PageImage]

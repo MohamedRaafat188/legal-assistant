@@ -73,7 +73,12 @@ class Settings(BaseSettings):
     # `ocr_provider` exists so the provider can be swapped without touching
     # callers, not so a local model can be plugged in.
     ocr_provider: str = "gemini"
-    ocr_model: str = "gemini-3-pro"
+    # "gemini-3-pro" (the original default) 404s -- it was never a real model
+    # id, and Task 13 built/tested this against a fake provider so the typo
+    # went unnoticed until Task 17's live run. "gemini-pro-latest" is Google's
+    # rolling alias for the current flagship pro-tier model, which is what
+    # the original name was clearly reaching for.
+    ocr_model: str = "gemini-pro-latest"
     # Two-pass OCR: a cheap low-DPI pass classifies every page, then only the
     # contract-body pages are re-rendered at full fidelity and transcribed.
     docgen_classify_dpi: int = 80

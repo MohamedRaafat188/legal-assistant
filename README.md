@@ -189,12 +189,48 @@ Key variables (see `.env.example`): `QDRANT_CLOUD_URL` / `QDRANT_CLOUD_API_KEY` 
 
 ## Phase 9 — Validation & testing
 
-No pytest suite exists yet (`tests/` is an empty package) — validation instead runs as standalone scripts that exercise the real stack end to end:
+For the RAG chat pipeline, no pytest suite exists (there is no isolated unit-test path for it) — validation instead runs as standalone scripts that exercise the real stack end to end:
 
 - `scripts/phase4_validate.py`, `phase5_validate.py`, `phase6_validate.py` — in-process validation (via `httpx.ASGITransport`) against the real database, Qdrant, embedding service, and Gemini: auth, conversation ownership, streaming citation ordering, cross-session citation reuse, user isolation, guard-fallback safety, and simulated downstream outages.
 - `scripts/railway_smoke_test.py <url>` — post-deploy smoke test against the **live** Railway URL: auth, a cited chat turn over SSE, cross-session memory, isolation, feedback, and polling Langfuse Cloud to confirm trace ingestion.
 - `scripts/check_retrieval.py` — proves the retrieval path (hybrid search → rerank → exact lookup) against Qdrant Cloud with real sample queries.
 - `scripts/check_embedding_consistency.py` — proves the deployed embedding service produces vectors numerically consistent with what's already stored in Qdrant Cloud.
+
+`docgen` (Phase 10, below) is different: `tests/docgen/` is a real, offline `pytest` suite (no services needed — every LLM call is faked), while `scripts/docgen_validate.py` fills the same live-stack role as `phase4_validate.py` and friends.
+
+---
+
+## Phase 10 — docgen: عقد تأسيس → قرار/محضر تعديل generation
+
+**Location:** `src/legal_assistant/docgen/`, routes in `src/legal_assistant/api/routes/docgen.py`
+
+A second, independent feature bolted onto the same app: a lawyer uploads a scanned Egyptian عقد تأسيس (articles of association), the system OCRs and segments it into numbered مواد, the lawyer picks which article(s) to amend and types the "بعد التعديل" text, and the system renders an editable Word document — a قرار تعديل (شركة شخص واحد) or a محضر جمعية عامة غير عادية (ذ.م.م. or مساهمة) — ready for GAFI filing.
+
+**Source modes.** A session declares one of two:
+- `aoa_only` — only the عقد تأسيس is uploaded; the lawyer types the commercial-registration number/date (and, currently, the company-law number/year — see the live-validation note below) directly, since there is no سجل تجاري to extract them from. Valid whenever the عقد has never been amended, so its own stated values are still current.
+- `aoa_plus_cr` — the عقد **and** a مستخرج سجل تجاري are both uploaded; fields extracted from the سجل (Box 9 for parties, etc.) take precedence over the عقد's own text where the two disagree, and the disagreement itself is recorded (`conflict`) rather than silently resolved.
+
+**Page-classification cost model.** OCR runs in two passes deliberately, not one: a cheap, low-DPI (`docgen_classify_dpi`, default 80) single batched call classifies every page as `body` / `attachment` / `signature` / `unknown` first, and only the pages classified `body` are re-rendered at full fidelity (`docgen_ocr_dpi`, default 220) and sent through the expensive per-page transcription call. A scanned عقد commonly runs 20-50+ pages once bank certificates, GAFI stamps, and blank backs are included; without this split every one of those pages would cost a full-fidelity vision call for no benefit.
+
+**No machine-generated prose.** Every string that ends up in the rendered `.docx` is one of exactly three things: verbatim OCR output, a mechanical span substitution recorded in `patch_ops` (e.g. swapping an old company address for a سجل-sourced one), or text the lawyer typed into the review screen. The LLM's only jobs are classifying pages, transcribing them character-for-character, and extracting typed fields into a JSON schema — it never drafts, paraphrases, or completes legal language. This is why the RAG citation guard (`rag/citation_guard.py`) does not apply here: that guard exists to catch a *generated* claim that isn't backed by retrieved text, and docgen never generates a claim to begin with. The equivalent discipline here is `templates/registry.verify_all()` (placeholder-contract enforcement, checked at app startup) plus `render.render_document`'s fail-closed behavior on a missing scalar or an empty article/attendee loop.
+
+**The nine routes** (`src/legal_assistant/api/routes/docgen.py`, all under `/docgen`, all ownership-scoped through `service.get_session`):
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /docgen/sessions` | create a session `{company_type, source_mode}` → `DocgenSessionOut` |
+| `POST /docgen/sessions/{id}/uploads` | multipart upload (`kind`=`aoa`\|`commercial_register`, `file`) → `202` + `DocgenUploadOut`; queues OCR as a background task once an `aoa` upload is present |
+| `GET /docgen/sessions/{id}` | full session detail — uploads, articles, extracted fields, warning → `DocgenSessionDetailOut` |
+| `PATCH /docgen/sessions/{id}/fields` | lawyer corrections to identity fields (`{fields: {...}}`), marks them user-sourced |
+| `PATCH /docgen/sessions/{id}/articles/{n}` | select an article, correct its OCR'd "قبل التعديل", or write its "بعد التعديل" |
+| `PATCH /docgen/sessions/{id}/attendees` | replace the attendee/shareholder roster; recomputes the capital reconciliation note |
+| `POST /docgen/sessions/{id}/render` | render the `.docx`; fails closed (`409`) on no selection, missing "بعد التعديل" text, or an attendee roster that doesn't reconcile against issued capital |
+| `GET /docgen/sessions/{id}/document` | download the rendered `.docx` |
+| `DELETE /docgen/sessions/{id}` | delete the session row and every file stored for it, immediately |
+
+**Retention.** Uploaded عقود and مستخرجات carry partners' national ID and passport numbers, so they live outside the database under a non-guessable storage key (`docgen_storage_dir`, `var/docgen/` locally) rather than in a DB column, and every session — its uploads, OCR text, and article text — is purged `docgen_retention_days` (2, by default) after creation. `scripts/docgen_purge.py` wraps `docgen.service.purge_expired` and must run as a **daily cron job** in production (see Phase 8); the session row itself survives in `expired` form for audit, but its content does not.
+
+**Live validation (`scripts/docgen_validate.py`).** Unlike the rest of docgen's test coverage (`tests/docgen/`, fully offline against a faked OCR provider by design — a mocked LLM response only tests the mock), this script hits the real Gemini vision model against real scanned samples end to end: OCR → article segmentation → field extraction → patch → render → a `document_text()` assertion pass. Running it against two real GAFI عقود surfaced defects no synthetic fixture could: an invalid default OCR model id, a Gemini-3-generation response-shape change that broke every OCR call (both fixed in this codebase — see `docgen/ocr/gemini.py` and `config.py`), and two `parsing/` gaps still open — the CAPITAL concept classifier's phrase list doesn't match a one-word "رأسمال" spelling, and `parse_party_table`'s roster lead-in regex doesn't match a "على الوجه الآتي" phrasing — both real, reproducible, and documented for a follow-up rather than patched under this validation task's scope (see the Task 17 report under `.superpowers/sdd/`).
 
 ---
 
