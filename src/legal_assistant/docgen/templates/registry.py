@@ -66,11 +66,12 @@ _COMMON_SCALARS = frozenset(
         "names_of_commissioners",
     }
 )
+# No `meeting_place`: both محضر templates hold the meeting at the head office
+# and name it with `company_address`.
 _MEETING_SCALARS = frozenset(
     {
         "meeting_time",
         "meeting_end_time",
-        "meeting_place",
         "chairman_name",
         "attendance_percentage",
         "approval_percentage",
@@ -93,10 +94,7 @@ _SPECS: dict[CompanyType, TemplateSpec] = {
     CompanyType.ZMM: TemplateSpec(
         company_type=CompanyType.ZMM,
         path=FILES / "محضر_تعديل_شركة_ذات_مسئولية_محدودة_template.docx",
-        # The ذ.م.م محضر holds the meeting at the head office, so its place IS
-        # `company_address`; it has no separate `meeting_place`.
-        scalar_placeholders=(_COMMON_SCALARS | _MEETING_SCALARS | {"company_address"})
-        - {"meeting_place"},
+        scalar_placeholders=_COMMON_SCALARS | _MEETING_SCALARS | {"company_address"},
         article_placeholders=_ARTICLE_FIELDS,
         attendee_placeholders=_ATTENDEE_FIELDS,
         attendee_label="partner",

@@ -295,7 +295,6 @@ async def run(
                     "chairman_name": "محمود عبد الرحمن",
                     "meeting_time": "الحادية عشرة صباحا",
                     "meeting_end_time": "الواحدة ظهرا",
-                    "meeting_place": "مقر الشركة",
                     "secretary_name": "سارة على",
                     "vote_collector_name": "محمد سمير",
                     "gafi_representative_name": "ممثل الهيئة",

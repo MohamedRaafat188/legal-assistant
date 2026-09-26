@@ -36,7 +36,6 @@ ZMM_SCALARS = {
     "names_of_commissioners": "أحمد كامل",
     "meeting_time": "الحادية عشرة صباحا",
     "meeting_end_time": "الواحدة ظهرا",
-    "meeting_place": "١٢ شارع النيل، الجيزة",
     "chairman_name": "مايكل فوزى",
     "attendance_percentage": "100",
     "approval_percentage": "100",
