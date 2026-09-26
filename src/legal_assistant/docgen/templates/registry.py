@@ -122,8 +122,7 @@ def get_template(company_type: str) -> TemplateSpec:
     """The spec for a company type. Raises KeyError on an unknown type.
 
     Looked up by string rather than by `CompanyType(company_type)` so that an
-    unknown type is a KeyError everywhere, instead of a ValueError here and a
-    KeyError in `sections.TARGET_INSTRUMENT`.
+    unknown type is a KeyError everywhere, instead of a ValueError.
     """
     for spec in _SPECS.values():
         if spec.company_type.value == company_type:

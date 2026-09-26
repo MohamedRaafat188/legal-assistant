@@ -1,8 +1,11 @@
 """Identify what an article is ABOUT, independent of its number.
 
 المركز الرئيسي is المادة (٥) in one sample and المادة (٦) in another, so
-number-based lookup is a bug waiting to happen. Every consumer asks for a
-Concept and gets whichever article actually says it.
+signatures no longer locate articles -- the lawyer's page map does, one
+number/span at a time. `states` cross-checks the lawyer's page map (it warns
+when an entry's article does not look like what they said it is, but never
+overrides their choice), and `classify` picks which field a declared article
+is the patch target for.
 
 Matching is keyword-based and deliberately dumb: no LLM, no embeddings.
 A wrong concept here only mis-targets a patch, and the patcher then fails
@@ -12,7 +15,6 @@ closed because the old value will not be found verbatim.
 from __future__ import annotations
 
 import enum
-from collections.abc import Sequence
 
 from legal_assistant.docgen.arabic import normalize_for_match
 from legal_assistant.docgen.parsing.articles import ExtractedArticle
@@ -68,13 +70,3 @@ def states(text: str, concept: Concept) -> bool:
     lawyer's article does not look like what they said it is; never overrides."""
     body = normalize_for_match(text)
     return any(phrase in body for phrase in _NORMALIZED[concept])
-
-
-def find_article(
-    articles: Sequence[ExtractedArticle], concept: Concept
-) -> ExtractedArticle | None:
-    """The first article stating `concept`, in document order."""
-    for article in articles:
-        if classify(article) is concept:
-            return article
-    return None

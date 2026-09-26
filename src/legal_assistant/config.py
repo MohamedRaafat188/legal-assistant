@@ -79,9 +79,9 @@ class Settings(BaseSettings):
     # rolling alias for the current flagship pro-tier model, which is what
     # the original name was clearly reaching for.
     ocr_model: str = "gemini-pro-latest"
-    # Two-pass OCR: a cheap low-DPI pass classifies every page, then only the
-    # contract-body pages are re-rendered at full fidelity and transcribed.
-    docgen_classify_dpi: int = 80
+    # Only the pages in the lawyer's submitted page map are OCR'd at full
+    # fidelity; this is the low-DPI rate for the on-demand page-picker thumbnail.
+    docgen_thumbnail_dpi: int = 60
     docgen_ocr_dpi: int = 220
     # Uploaded عقود carry national ID and passport numbers, so they live
     # outside the DB under a non-guessable key and are purged on expiry.

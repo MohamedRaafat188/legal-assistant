@@ -33,11 +33,13 @@ def test_every_documented_route_exists(routes):
         ("/docgen/sessions/{session_id}/uploads", "POST"),
         ("/docgen/sessions/{session_id}", "GET"),
         ("/docgen/sessions/{session_id}/fields", "PATCH"),
-        ("/docgen/sessions/{session_id}/articles/{article_number}", "PATCH"),
+        ("/docgen/sessions/{session_id}/articles/{position}", "PATCH"),
         ("/docgen/sessions/{session_id}/attendees", "PATCH"),
         ("/docgen/sessions/{session_id}/render", "POST"),
         ("/docgen/sessions/{session_id}/document", "GET"),
         ("/docgen/sessions/{session_id}", "DELETE"),
+        ("/docgen/sessions/{session_id}/page-map", "PUT"),
+        ("/docgen/sessions/{session_id}/uploads/{upload_id}/pages/{page}", "GET"),
     }
     assert expected <= routes
 
@@ -64,3 +66,26 @@ def test_the_router_is_mounted_on_the_app():
 
     paths = {ctx.path for ctx in iter_route_contexts(create_app().routes)}
     assert "/docgen/sessions" in paths
+
+
+def test_article_out_exposes_position_and_flags_not_selected():
+    names = set(DocgenArticleOut.model_fields)
+    assert {"position", "is_mukarrar", "status", "span_first", "span_last",
+            "possibly_truncated"} <= names
+    assert "selected" not in names
+
+
+def test_upload_out_no_longer_reports_page_classification():
+    assert "page_classification" not in DocgenUploadOut.model_fields
+
+
+def test_page_map_request_accepts_the_spec_shape():
+    from legal_assistant.api.schemas import DocgenPageMapRequest
+
+    body = DocgenPageMapRequest.model_validate(
+        {"entries": {"company_name": {"from": 1, "to": 1, "article": "2"}},
+         "amended": [{"from": 3, "to": 4, "article": "٦ مكرر"}]}
+    )
+    assert body.model_dump(by_alias=True)["amended"][0] == {
+        "from": 3, "to": 4, "article": "٦ مكرر"
+    }

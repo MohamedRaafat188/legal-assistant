@@ -1,8 +1,9 @@
 """Orchestration for docgen. The only module the API routes touch.
 
-Flow: create session -> upload -> classify pages cheaply -> OCR the body
-pages -> split instruments -> segment articles -> extract identity fields ->
-patch -> lawyer reviews and writes "بعد التعديل" -> render.
+Flow: create session -> upload -> lawyer submits the page map -> OCR only the
+mapped pages (per-page cache) -> scope each entry by span and article ->
+extract identity fields -> one row per declared article -> patch -> lawyer
+writes "بعد التعديل" -> render.
 
 Nothing here writes legal prose. Article text reaching the document is
 verbatim OCR output, a span substitution recorded in `patch_ops`, or text
@@ -32,7 +33,7 @@ from sqlalchemy.orm import selectinload
 
 from legal_assistant.config import get_settings
 from legal_assistant.db.session import get_sessionmaker
-from legal_assistant.docgen import pdf, storage
+from legal_assistant.docgen import pages, pdf, storage
 from legal_assistant.docgen.arabic import to_ascii_digits
 from legal_assistant.docgen.models import (
     DocgenArticle,
@@ -44,19 +45,23 @@ from legal_assistant.docgen.models import (
     UploadKind,
     default_expires_at,
 )
-from legal_assistant.docgen.numbering import article_name, ordinal_words
-from legal_assistant.docgen.ocr.base import OcrError, body_pages, get_provider
-from legal_assistant.docgen.parsing import sections
-from legal_assistant.docgen.parsing.articles import ExtractedArticle
+from legal_assistant.docgen.numbering import ArticleRef, article_name, ordinal_words
+from legal_assistant.docgen.ocr.base import OcrError, get_provider
+from legal_assistant.docgen.pages import (
+    PREAMBLE,
+    Entry,
+    PageMap,
+    PageMapError,  # noqa: F401 -- re-exported for the routes
+    validate_page_map,
+)
+from legal_assistant.docgen.parsing.articles import LookupStatus
 from legal_assistant.docgen.parsing.commercial_register import (
     CR_FIELD_SCHEMA,
     CompanyRecord,
-    Party,
-    parse_party_table,
     record_from_payload,
-    split_capital,
 )
-from legal_assistant.docgen.parsing.signatures import Concept, classify, find_article
+from legal_assistant.docgen.parsing.scoped import AoaExtraction, extract_aoa, scope
+from legal_assistant.docgen.parsing.signatures import Concept, classify
 from legal_assistant.docgen.parsing.values import current_value as _current_value
 from legal_assistant.docgen.patching import PatchResult, Replacement, patch_article
 from legal_assistant.docgen.pdf import InvalidPdfError
@@ -83,7 +88,7 @@ class SessionStateError(RuntimeError):
 
 
 class NothingSelectedError(SessionStateError):
-    """Render was requested with no article selected."""
+    """Render was requested with no declared article."""
 
 
 # --- pure helpers (unit-tested) ------------------------------------------
@@ -523,7 +528,11 @@ async def get_session(db: AsyncSession, session_id: int, user_id: int) -> Docgen
 async def add_upload(
     db: AsyncSession, session: DocgenSession, kind: str, filename: str, data: bytes
 ) -> DocgenUpload:
-    """Store an uploaded PDF and record it. Does not start OCR."""
+    """Store an uploaded PDF and record it.
+
+    Starts nothing: the lawyer picks pages from on-demand thumbnails, then
+    submits the page map.
+    """
     if kind not in {k.value for k in UploadKind}:
         raise SessionStateError(f"unknown upload kind: {kind}")
     if session.status == SessionStatus.ocr_running.value:
@@ -532,6 +541,13 @@ async def add_upload(
     count = _run_stage_sync("قراءة عدد صفحات الملف", pdf.page_count, data)
     key = storage.new_key(session.id, kind)
     _run_stage_sync("حفظ الملف المرفوع", storage.write, key, data)
+
+    for old in [u for u in session.uploads if u.kind == kind]:
+        _run_stage_sync("حذف الملف السابق", storage.delete, old.storage_key)
+        await db.delete(old)
+    if kind == UploadKind.aoa.value:
+        # Page numbers in the old map may point elsewhere in the new file.
+        session.page_map = None
 
     upload = DocgenUpload(
         session_id=session.id, kind=kind, filename=filename, storage_key=key, page_count=count
@@ -547,6 +563,41 @@ async def add_upload(
     return upload
 
 
+async def submit_page_map(db: AsyncSession, session: DocgenSession, raw: dict) -> PageMap:
+    """Validate and store the lawyer's page map. The caller queues OCR.
+
+    Needs the عقد uploaded first (and the سجل too, in aoa_plus_cr): the map is
+    validated against the عقد's page count.
+    """
+    if session.status == SessionStatus.ocr_running.value:
+        raise SessionStateError("جارٍ تحليل الملف الحالى، انتظر حتى ينتهى.")
+    uploads = {u.kind: u for u in session.uploads}
+    aoa = uploads.get(UploadKind.aoa.value)
+    if aoa is None:
+        raise SessionStateError("لم يتم رفع عقد التأسيس بعد.")
+    if (
+        session.source_mode == SourceMode.aoa_plus_cr.value
+        and UploadKind.commercial_register.value not in uploads
+    ):
+        raise SessionStateError("الوضع المختار يتطلب رفع مستخرج السجل التجارى.")
+    page_map = validate_page_map(raw, session.company_type, aoa.page_count or 0)
+    session.page_map = page_map.to_json()
+    _invalidate_document(session)
+    await _safe_flush(db)
+    return page_map
+
+
+def thumbnail(session: DocgenSession, upload_id: int, page: int) -> bytes:
+    """One page of one of this session's uploads as PNG, rendered now."""
+    upload = next((u for u in session.uploads if u.id == upload_id), None)
+    if upload is None or not 1 <= page <= (upload.page_count or 0):
+        raise SessionNotFoundError("page not found")
+    data = _run_stage_sync("قراءة الملف المرفوع", storage.read, upload.storage_key)
+    return _run_stage_sync(
+        "تجهيز صفحة المعاينة", pages.thumbnail, data, page, get_settings().docgen_thumbnail_dpi
+    )
+
+
 def _claim_for_ocr_statement(session_id: int):
     """The atomic claim `run_ocr_job` uses to start OCR for `session_id`.
 
@@ -555,7 +606,8 @@ def _claim_for_ocr_statement(session_id: int):
     directly (compiled to a literal SQL string) without a database
     connection; see `test_claim_for_ocr_statement_*` in
     `tests/docgen/test_service.py`. The statement itself is only ever
-    executed from `run_ocr_job`.
+    executed from `run_ocr_job`. Without a submitted page map there are no
+    pages to OCR.
     """
     return (
         update(DocgenSession)
@@ -563,13 +615,14 @@ def _claim_for_ocr_statement(session_id: int):
             DocgenSession.id == session_id,
             DocgenSession.status != SessionStatus.ocr_running.value,
             DocgenSession.expires_at > func.now(),
+            DocgenSession.page_map.is_not(None),
         )
         .values(status=SessionStatus.ocr_running.value, error=None)
     )
 
 
 async def run_ocr_job(session_id: int) -> None:
-    """Background entry point: classify, OCR, segment, extract, patch.
+    """Background entry point: OCR the mapped pages, scope, extract, patch.
 
     Opens its OWN database session -- the request that queued this job has
     already returned and its session is closed. Every failure path lands the
@@ -656,6 +709,107 @@ async def run_ocr_job(session_id: int) -> None:
                 await db.commit()
 
 
+_SCALAR_FIELDS = (
+    "commercial_registration_no", "commercial_registration_date", "company_name",
+    "law_number", "law_year", "company_address", "owner_name", "capital", "issued_capital",
+)
+# field -> the page-map entry it is read from
+_FIELD_ENTRY = {
+    "company_name": "company_name", "law_number": "law_reference",
+    "law_year": "law_reference", "company_address": "company_address",
+    "owner_name": "owner_name", "capital": "issued_capital",
+    "issued_capital": "issued_capital",
+}
+
+
+def _article_label(entry: Entry) -> str:
+    if entry.article is None:
+        return PREAMBLE
+    return str(entry.article.number) + (" مكرر" if entry.article.mukarrar else "")
+
+
+def merge_fields(
+    aoa: AoaExtraction, cr: CompanyRecord, previous: dict, page_map: PageMap
+) -> tuple[CompanyRecord, dict]:
+    """Combine عقد and سجل values into the provenance map the review screen shows.
+
+    - The سجل wins as the PROPOSED value; a disagreement is recorded in
+      `conflict`, never silently resolved.
+    - A field the lawyer already corrected (`source == "user"`) is kept as is:
+      re-running extraction after a page-map edit must never undo a correction.
+    - Each field records the span and article it was read from, plus the
+      entry's flags.
+    - A roster the lawyer edited (`attendees_edited`) is kept as is.
+    """
+    provenance: dict = {}
+    for name in _SCALAR_FIELDS:
+        old = previous.get(name) or {}
+        if old.get("source") == "user":
+            provenance[name] = old
+            continue
+        cr_value = getattr(cr, name, None)
+        aoa_value = aoa.values.get(name)
+        value = cr_value or aoa_value
+        entry = page_map.entries.get(_FIELD_ENTRY.get(name, ""))
+        provenance[name] = {
+            "value": value,
+            "source": "cr" if cr_value else ("aoa" if aoa_value else "user"),
+            "span": {"from": entry.first, "to": entry.last} if entry else None,
+            "article": _article_label(entry) if entry else None,
+            "confidence": 1.0 if value else 0.0,
+            "flags": list(aoa.flags.get(entry.name, [])) if entry else [],
+            "conflict": (
+                {"cr": cr_value, "aoa": aoa_value}
+                if cr_value and aoa_value and cr_value != aoa_value
+                else None
+            ),
+        }
+
+    parties = cr.parties or aoa.parties
+    if previous.get("attendees_edited"):
+        attendees = previous.get("attendees", [])
+        provenance["attendees_edited"] = True
+    else:
+        # Box (9) is authoritative when populated; the عقد's table is the fallback.
+        attendees = [
+            {"name": p.name, "shares": p.shares, "percentage": p.percentage,
+             "attending": True, "source": "cr" if cr.parties else "aoa"}
+            for p in parties
+        ]
+    provenance["attendees"] = attendees
+    provenance["capital_reconciliation"] = _reconcile_capital(
+        attendees, provenance["issued_capital"]["value"]
+    )
+    record = CompanyRecord(
+        **{n: provenance[n]["value"] for n in _SCALAR_FIELDS}, parties=list(parties)
+    )
+    return record, provenance
+
+
+def carry_over(
+    amended: Sequence[Entry], existing: Sequence[DocgenArticle]
+) -> list[tuple[Entry, DocgenArticle | None, str | None]]:
+    """For each declared article, either the existing row to KEEP (same article
+    and same span: nothing to re-extract, and the lawyer's edits survive), or
+    None plus any "بعد التعديل" text to carry into the rebuilt row (same
+    article, span changed). مكرر never matches its base article."""
+    out = []
+    for entry in amended:
+        same_ref = [
+            r for r in existing
+            if ArticleRef(r.article_number, bool(r.is_mukarrar)) == entry.article
+        ]
+        exact = next(
+            (r for r in same_ref if (r.span_first, r.span_last) == (entry.first, entry.last)),
+            None,
+        )
+        if exact is not None:
+            out.append((entry, exact, None))
+        else:
+            out.append((entry, None, same_ref[0].new_text if same_ref else None))
+    return out
+
+
 async def _run_ocr(session_id: int) -> None:
     settings = get_settings()
     provider = get_provider(settings)
@@ -671,57 +825,38 @@ async def _run_ocr(session_id: int) -> None:
         uploads = {u.kind: u for u in session.uploads}
         company_type = session.company_type
         source_mode = session.source_mode
+        page_map = PageMap.from_json(session.page_map)
+        previous_fields = dict(session.fields.data or {}) if session.fields else {}
 
     aoa = uploads.get(UploadKind.aoa.value)
     if aoa is None:
         raise SessionStateError("لم يتم رفع عقد التأسيس.")
 
-    # 1. Cheap classification pass over every page.
-    aoa_bytes = _run_stage_sync("قراءة عقد التأسيس المرفوع", storage.read, aoa.storage_key)
-    thumbnails = _run_stage_sync(
-        "تجهيز صفحات المعاينة", pdf.render_pages, aoa_bytes, dpi=settings.docgen_classify_dpi
-    )
-    classifications = await _run_stage_async(
-        "تصنيف صفحات الملف", provider.classify_pages(thumbnails)
-    )
-    wanted = body_pages(classifications)
-    if not wanted:
-        raise OcrError("لم يتم التعرف على عقد تأسيس داخل هذا الملف.")
+    # 1. OCR only the mapped pages not already cached for this session.
+    cache = {int(k): v for k, v in (aoa.ocr_pages or {}).items()}
+    missing = [p for p in page_map.ocr_pages() if p not in cache]
+    if missing:
+        aoa_bytes = _run_stage_sync("قراءة عقد التأسيس المرفوع", storage.read, aoa.storage_key)
+        images = _run_stage_sync(
+            "تجهيز صفحات العقد للتعرف الضوئى",
+            pdf.render_pages,
+            aoa_bytes,
+            dpi=settings.docgen_ocr_dpi,
+            pages=missing,
+        )
+        texts = await _run_stage_async("التعرف الضوئى على نص العقد", provider.extract(images))
+        for text in texts:
+            cache[text.page] = {"text": text.text, "confidence": text.confidence}
+    page_texts = {p: v["text"] for p, v in cache.items()}
 
-    # 2. Full-fidelity OCR on body pages only.
-    pages = _run_stage_sync(
-        "تجهيز صفحات العقد للتعرف الضوئى",
-        pdf.render_pages,
-        aoa_bytes,
-        dpi=settings.docgen_ocr_dpi,
-        pages=wanted,
+    # 2. Scoped extraction: each entry sees only its span + article.
+    aoa_values = extract_aoa(page_texts, page_map, company_type)
+    cr_record = await _run_stage_async(
+        "استخراج بيانات السجل التجارى", _extract_cr(provider, source_mode, uploads, settings)
     )
-    page_texts = await _run_stage_async("التعرف الضوئى على نص العقد", provider.extract(pages))
-    full_text = "\n".join(p.text for p in page_texts)
-    page_confidence = (
-        sum(p.confidence for p in page_texts) / len(page_texts) if page_texts else 0.0
-    )
+    record, provenance = merge_fields(aoa_values, cr_record, previous_fields, page_map)
 
-    # 3. Instrument split, then article segmentation on the right series.
-    instruments = sections.split_instruments(full_text)
-    articles, warning = sections.select_target(instruments, company_type)
-    if not articles:
-        # A session with zero articles can never be rendered (render_session
-        # already fails closed via NothingSelectedError once there is at
-        # least a `selected` flag to check, but there is nothing here for
-        # the lawyer to select at all) -- land the job in `failed`, not
-        # `ready`, so this is never mistaken for a completed-but-empty
-        # session. `warning` is a static, content-free message authored by
-        # `sections.select_target` itself.
-        raise OcrError(warning or "لم يتم العثور على مواد قابلة للتعديل داخل الملف.")
-
-    # 4. Identity fields.
-    record, provenance = await _run_stage_async(
-        "استخراج بيانات هوية الشركة",
-        _extract_fields(provider, source_mode, uploads, articles, settings),
-    )
-
-    # 5. Patch and persist.
+    # 3. Persist.
     async with sessionmaker() as db:
         session = await _load_session_unowned(db, session_id)
         if session is None:
@@ -753,180 +888,119 @@ async def _run_ocr(session_id: int) -> None:
             )
             return
         aoa_row = await db.get(DocgenUpload, aoa.id)
-        aoa_row.page_classification = [
-            {
-                "page": c.page,
-                "kind": c.kind.value,
-                "starts_article": c.starts_article,
-                "confidence": c.confidence,
-            }
-            for c in classifications
-        ]
+        aoa_row.ocr_pages = {str(p): v for p, v in cache.items()}
 
-        await db.execute(
-            DocgenArticle.__table__.delete().where(DocgenArticle.session_id == session_id)
+        existing = list(
+            (
+                await db.execute(
+                    select(DocgenArticle).where(DocgenArticle.session_id == session_id)
+                )
+            ).scalars()
         )
-        for article in articles:
-            db.add(_build_article_row(session_id, article, record, source_mode, page_confidence))
+        plan = carry_over(page_map.amended, existing)
+        kept_ids = {row.id for _entry, row, _text in plan if row is not None}
+        for row in existing:
+            if row.id not in kept_ids:
+                await db.delete(row)
+        rebuilt_missing = False
+        for position, (entry, row, carried_text) in enumerate(plan):
+            if row is not None:
+                row.position = position
+                continue
+            scoped = scope(page_texts, entry)
+            rebuilt_missing |= scoped.status is not LookupStatus.found
+            new_row = _build_article_row(
+                session_id, position, entry, scoped, record, source_mode,
+                _span_confidence(cache, entry),
+            )
+            new_row.new_text = carried_text
+            db.add(new_row)
 
         fields_row = await db.scalar(
             select(DocgenFields).where(DocgenFields.session_id == session_id)
         )
         fields_row.data = provenance
 
+        flagged = any(
+            isinstance(v, dict) and v.get("flags") and v.get("source") != "user"
+            for v in provenance.values()
+        )
         session.status = SessionStatus.ready.value
-        session.error = warning
+        # Static text only -- never interpolate document content here.
+        session.error = (
+            "بعض البيانات أو المواد لم يُعثر عليها فى الصفحات المحددة؛ راجع العلامات "
+            "قبل الإنشاء."
+            if flagged or rebuilt_missing
+            else None
+        )
         await _safe_commit(db)
+
+
+def _span_confidence(cache: dict, entry: Entry) -> float:
+    values = [cache[p]["confidence"] for p in entry.pages if p in cache]
+    return sum(values) / len(values) if values else 0.0
+
+
+async def _extract_cr(provider, source_mode: str, uploads: dict, settings) -> CompanyRecord:
+    """The سجل side: the whole file, unchanged from before."""
+    if source_mode != SourceMode.aoa_plus_cr.value:
+        return CompanyRecord()
+    cr = uploads.get(UploadKind.commercial_register.value)
+    if cr is None:
+        return CompanyRecord()
+    cr_bytes = _run_stage_sync("قراءة مستخرج السجل التجارى المرفوع", storage.read, cr.storage_key)
+    images = _run_stage_sync(
+        "تجهيز صفحات مستخرج السجل التجارى", pdf.render_pages, cr_bytes,
+        dpi=settings.docgen_ocr_dpi,
+    )
+    return record_from_payload(await provider.extract_fields(images, CR_FIELD_SCHEMA))
 
 
 def _build_article_row(
     session_id: int,
-    article: ExtractedArticle,
+    position: int,
+    entry: Entry,
+    scoped,
     record: CompanyRecord,
     source_mode: str,
     confidence: float,
 ) -> DocgenArticle:
-    concept = classify(article)
-    if source_mode == SourceMode.aoa_plus_cr.value:
-        result = apply_patches(article.body, plan_patches(record, concept, article.body))
-    else:
-        # aoa_only: the عقد has never been amended, so its text is already
-        # current. Patching is a declared no-op, not a silent skip.
-        result = apply_patches(article.body, [])
-
-    return DocgenArticle(
+    ref = entry.article
+    base = dict(
         session_id=session_id,
-        article_number=article.number,
-        ordinal_words=ordinal_words(article.number)
-        if 1 <= article.number <= 99
-        else str(article.number),
+        position=position,
+        article_number=ref.number,
+        is_mukarrar=ref.mukarrar,
+        ordinal_words=ordinal_words(ref.number) if 1 <= ref.number <= 99 else str(ref.number),
+        span_first=entry.first,
+        span_last=entry.last,
+        confidence=confidence,
+    )
+    if scoped.status is not LookupStatus.found:
+        # Nothing verbatim to show; the lawyer fixes the map or types "قبل".
+        return DocgenArticle(
+            **base, status=scoped.status.value, source_text="", patched_text="",
+            patch_ops=[], needs_review=True, possibly_truncated=False,
+        )
+    article = scoped.article
+    if source_mode == SourceMode.aoa_plus_cr.value:
+        replacements = plan_patches(record, classify(article), article.body)
+    else:
+        # aoa_only: the عقد has never been amended -- a declared no-op.
+        replacements = []
+    result = apply_patches(article.body, replacements)
+    return DocgenArticle(
+        **base,
+        status=LookupStatus.found.value,
         source_text=article.body,
         patched_text=result.text,
         patch_ops=[
-            {
-                "start": op.start,
-                "end": op.end,
-                "old": op.old,
-                "new": op.new,
-                "field": op.field,
-                "source": op.source,
-            }
+            {"start": op.start, "end": op.end, "old": op.old, "new": op.new,
+             "field": op.field, "source": op.source}
             for op in result.ops
         ],
-        confidence=confidence,
-        needs_review=result.needs_review,
-        selected=False,
-    )
-
-
-async def _extract_fields(
-    provider, source_mode: str, uploads: dict, articles: Sequence[ExtractedArticle], settings
-) -> tuple[CompanyRecord, dict]:
-    """Build the CompanyRecord and its provenance map.
-
-    In `aoa_plus_cr` the سجل wins as the PROPOSED value, but a disagreement
-    with the عقد is recorded in `conflict` and surfaced -- never silently
-    resolved. The attendee roster built here also gets a capital
-    reconciliation note (see `_reconcile_capital`) recorded alongside it, so
-    the review screen can show it before the lawyer ever attempts a render;
-    `render_session` recomputes the same check against the roster as it
-    stands at render time, since edits since extraction can change the
-    answer.
-    """
-    from_aoa = _record_from_articles(articles)
-
-    from_cr = CompanyRecord()
-    if source_mode == SourceMode.aoa_plus_cr.value:
-        cr = uploads.get(UploadKind.commercial_register.value)
-        if cr is not None:
-            cr_bytes = _run_stage_sync(
-                "قراءة مستخرج السجل التجارى المرفوع", storage.read, cr.storage_key
-            )
-            images = _run_stage_sync(
-                "تجهيز صفحات مستخرج السجل التجارى",
-                pdf.render_pages,
-                cr_bytes,
-                dpi=settings.docgen_ocr_dpi,
-            )
-            payload = await provider.extract_fields(images, CR_FIELD_SCHEMA)
-            from_cr = record_from_payload(payload)
-
-    provenance: dict = {}
-    for name in (
-        "commercial_registration_no",
-        "commercial_registration_date",
-        "company_name",
-        "law_number",
-        "law_year",
-        "company_address",
-        "capital",
-        "issued_capital",
-    ):
-        cr_value = getattr(from_cr, name)
-        aoa_value = getattr(from_aoa, name)
-        value = cr_value or aoa_value
-        conflict = None
-        if cr_value and aoa_value and cr_value != aoa_value:
-            conflict = {"cr": cr_value, "aoa": aoa_value}
-        provenance[name] = {
-            "value": value,
-            "source": "cr" if cr_value else ("aoa" if aoa_value else "user"),
-            "confidence": 1.0 if value else 0.0,
-            "conflict": conflict,
-        }
-
-    # Box (9) is authoritative when populated; the عقد's share table is the
-    # fallback. Where neither states holdings, names still prefill and the
-    # review screen asks the lawyer for the numbers.
-    parties = from_cr.parties or from_aoa.parties
-    attendees = [
-        {
-            "name": p.name,
-            "shares": p.shares,
-            "percentage": p.percentage,
-            "attending": True,
-            "source": "cr" if from_cr.parties else "aoa",
-        }
-        for p in parties
-    ]
-    provenance["attendees"] = attendees
-    # Surfaced, never silently trusted: a roster that looks internally
-    # consistent (its shares sum to something) is not the same as a roster
-    # that is COMPLETE. See `_reconcile_capital`.
-    provenance["capital_reconciliation"] = _reconcile_capital(
-        attendees, provenance["issued_capital"]["value"]
-    )
-
-    merged = CompanyRecord(
-        **{
-            name: provenance[name]["value"]
-            for name in provenance
-            if name not in ("attendees", "capital_reconciliation")
-        },
-        parties=list(parties),
-    )
-    return merged, provenance
-
-
-def _record_from_articles(articles: Sequence[ExtractedArticle]) -> CompanyRecord:
-    """Everything the عقد itself states, used as fallback and as the conflict side."""
-    name_article = find_article(articles, Concept.COMPANY_NAME)
-    office = find_article(articles, Concept.HEAD_OFFICE)
-    capital = find_article(articles, Concept.CAPITAL)
-    parties: list[Party] = parse_party_table(capital.body) if capital else []
-    # مساهمة states رأس المال المرخص به and رأس المال المصدر separately; the
-    # quorum is computed from المصدر, so the two are kept apart from here on.
-    _authorized, issued = split_capital(capital.body) if capital else (None, None)
-    return CompanyRecord(
-        company_name=_current_value("company_name", name_article.body) or None
-        if name_article
-        else None,
-        company_address=_current_value("company_address", office.body) or None
-        if office
-        else None,
-        capital=_current_value("capital", capital.body) or None if capital else None,
-        issued_capital=issued,
-        parties=parties,
+        needs_review=result.needs_review or scoped.truncated,
+        possibly_truncated=scoped.truncated,
     )
 
 
@@ -956,13 +1030,12 @@ async def update_fields(db: AsyncSession, session: DocgenSession, changes: dict)
 async def update_article(
     db: AsyncSession,
     session: DocgenSession,
-    article_number: int,
+    position: int,
     *,
-    selected: bool | None = None,
     patched_text: str | None = None,
     new_text: str | None = None,
 ) -> DocgenArticle:
-    """Select an article, correct its "قبل التعديل", or write its "بعد التعديل".
+    """Correct an article's "قبل التعديل", or write its "بعد التعديل".
 
     `source_text` is never touched, so the verbatim OCR output stays
     auditable next to whatever the lawyer changed.
@@ -970,13 +1043,11 @@ async def update_article(
     article = await db.scalar(
         select(DocgenArticle).where(
             DocgenArticle.session_id == session.id,
-            DocgenArticle.article_number == article_number,
+            DocgenArticle.position == position,
         )
     )
     if article is None:
-        raise SessionNotFoundError(f"article {article_number} is not in this session")
-    if selected is not None:
-        article.selected = selected
+        raise SessionNotFoundError(f"article position {position} is not in this session")
     if patched_text is not None:
         article.patched_text = patched_text
         article.needs_review = False
@@ -1001,6 +1072,9 @@ async def update_attendees(
     row = await db.scalar(select(DocgenFields).where(DocgenFields.session_id == session.id))
     data = dict(row.data or {})
     data["attendees"] = attendees
+    # See `merge_fields`: this flag is what stops a later OCR re-run from
+    # clobbering a roster the lawyer has hand-edited here.
+    data["attendees_edited"] = True
     issued_capital = ((data.get("issued_capital") or {}).get("value")) or None
     data["capital_reconciliation"] = _reconcile_capital(attendees, issued_capital)
     row.data = data
@@ -1015,8 +1089,8 @@ async def render_session(db: AsyncSession, session: DocgenSession) -> bytes:
     """Render the document. Idempotent and re-runnable.
 
     Fails closed rather than emit a partially-complete instrument:
-    - no article selected -> `NothingSelectedError`;
-    - a selected article with no "بعد التعديل" text yet -> `SessionStateError`
+    - no declared article -> `NothingSelectedError`;
+    - a declared article with no "بعد التعديل" text yet -> `SessionStateError`
       naming it;
     - for a company type with an attendance table, a roster that does not
       reconcile against the issued capital -> `SessionStateError` (a wrong
@@ -1025,19 +1099,23 @@ async def render_session(db: AsyncSession, session: DocgenSession) -> bytes:
     - any placeholder `render_document` cannot fill -> `MissingContextError`
       (raised by `render_document` itself; not caught or papered over here).
     """
-    articles = [a for a in session.articles if a.selected]
+    articles = list(session.articles)
     if not articles:
-        raise NothingSelectedError("اختر مادة واحدة على الأقل للتعديل.")
-    missing = [a.article_number for a in articles if not (a.new_text or "").strip()]
+        raise NothingSelectedError("لا توجد مواد معلنة للتعديل؛ أرسل خريطة الصفحات أولا.")
+    label = lambda a: article_name(a.article_number, a.is_mukarrar)  # noqa: E731
+    blank = [a for a in articles if not (a.patched_text or "").strip()]
+    if blank:
+        raise SessionStateError(f"اكتب نص «قبل التعديل» للمواد: {[label(a) for a in blank]}")
+    missing = [a for a in articles if not (a.new_text or "").strip()]
     if missing:
-        raise SessionStateError(f"اكتب نص «بعد التعديل» للمواد: {missing}")
+        raise SessionStateError(f"اكتب نص «بعد التعديل» للمواد: {[label(a) for a in missing]}")
 
     row = await db.scalar(select(DocgenFields).where(DocgenFields.session_id == session.id))
     data = row.data or {}
     scalars = {
         name: (entry or {}).get("value") or ""
         for name, entry in data.items()
-        if name not in ("attendees", "capital_reconciliation")
+        if name not in ("attendees", "capital_reconciliation", "attendees_edited")
     }
 
     spec = get_template(session.company_type)
@@ -1057,13 +1135,13 @@ async def render_session(db: AsyncSession, session: DocgenSession) -> bytes:
         scalars=scalars,
         articles=[
             ArticleBlock(
-                article_name=article_name(a.article_number),
+                article_name=label(a),
                 article_original_content=a.patched_text,
                 article_new_content=a.new_text or "",
             )
             for a in articles
         ],
-        article_numbers=[a.article_number for a in articles],
+        article_numbers=[ArticleRef(a.article_number, a.is_mukarrar) for a in articles],
         attendees=[
             Attendee(
                 name=p.get("name", ""),

@@ -1,6 +1,6 @@
 """Regression tests: no synthetic personal-data string may survive into any
 part of an `OcrError` raised by `GeminiOcrProvider`, or into the repr of
-`PageText`/`PageClassification`.
+`PageText`.
 
 Table-driven over every failure path so this class of leak (raw model
 output, or an underlying exception's message, folded into an exception seen
@@ -16,7 +16,7 @@ import traceback
 
 import pytest
 
-from legal_assistant.docgen.ocr.base import OcrError, PageClassification, PageKind, PageText
+from legal_assistant.docgen.ocr.base import OcrError, PageText
 from legal_assistant.docgen.ocr.gemini import GeminiOcrProvider
 from legal_assistant.docgen.pdf import PageImage
 
@@ -119,11 +119,6 @@ def _assert_sensitive_absent(exc: Exception, sensitive: str) -> None:
 # Each entry is (label, coroutine-factory). The factory takes no args and
 # returns the awaitable to run; it must raise OcrError.
 
-def _non_json_classify():
-    provider = _provider(_FakeLlmReturns(f"not json at all {SENSITIVE_TEXT}"))
-    return provider.classify_pages(_IMAGES)
-
-
 def _non_json_extract():
     provider = _provider(_FakeLlmReturns(f"not json at all {SENSITIVE_TEXT}"))
     return provider.extract(_IMAGES)
@@ -132,13 +127,6 @@ def _non_json_extract():
 def _non_json_extract_fields():
     provider = _provider(_FakeLlmReturns(f"not json at all {SENSITIVE_TEXT}"))
     return provider.extract_fields(_IMAGES, schema={"type": "object"})
-
-
-def _ask_raises_classify():
-    provider = _provider(
-        _FakeLlmRaises(RuntimeError(f"upstream failure, request body was: {SENSITIVE_TEXT}"))
-    )
-    return provider.classify_pages(_IMAGES)
 
 
 def _ask_raises_extract():
@@ -155,12 +143,6 @@ def _ask_raises_extract_fields():
     return provider.extract_fields(_IMAGES, schema={"type": "object"})
 
 
-def _wrong_shape_classify():
-    # Valid JSON, but not the expected list shape.
-    provider = _provider(_FakeLlmReturns('{"not": "a list"}'))
-    return provider.classify_pages(_IMAGES)
-
-
 def _wrong_shape_extract():
     provider = _provider(_FakeLlmReturns("[1, 2, 3]"))
     return provider.extract(_IMAGES)
@@ -172,13 +154,10 @@ def _wrong_shape_extract_fields():
 
 
 FAILURE_PATHS = {
-    "non_json / classify_pages (_parse_json raise site)": _non_json_classify,
     "non_json / extract (_parse_json raise site)": _non_json_extract,
     "non_json / extract_fields (_parse_json raise site)": _non_json_extract_fields,
-    "llm_raises / classify_pages (_ask catch-all raise site)": _ask_raises_classify,
     "llm_raises / extract (_ask catch-all raise site)": _ask_raises_extract,
     "llm_raises / extract_fields (_ask catch-all raise site)": _ask_raises_extract_fields,
-    "wrong_shape / classify_pages": _wrong_shape_classify,
     "wrong_shape / extract": _wrong_shape_extract,
     "wrong_shape / extract_fields": _wrong_shape_extract_fields,
 }
@@ -202,16 +181,16 @@ def test_non_json_error_message_still_names_the_call_site_and_length():
     """The sanitized message must stay debuggable: which call, how long."""
     provider = _provider(_FakeLlmReturns(f"not json at all {SENSITIVE_TEXT}"))
     with pytest.raises(OcrError) as excinfo:
-        asyncio.run(provider.classify_pages(_IMAGES))
+        asyncio.run(provider.extract(_IMAGES))
     message = str(excinfo.value)
-    assert "classify_pages" in message
+    assert "extract page 1" in message
     assert "length=" in message
 
 
 def test_ask_failure_message_still_names_the_exception_type():
     provider = _provider(_FakeLlmRaises(RuntimeError("boom")))
     with pytest.raises(OcrError) as excinfo:
-        asyncio.run(provider.classify_pages(_IMAGES))
+        asyncio.run(provider.extract(_IMAGES))
     assert "RuntimeError" in str(excinfo.value)
 
 
@@ -228,7 +207,7 @@ def test_json_decode_error_is_fully_detached_not_just_suppressed():
     """
     provider = _provider(_FakeLlmReturns(f"not json {SENSITIVE_TEXT}"))
     with pytest.raises(OcrError) as excinfo:
-        asyncio.run(provider.classify_pages(_IMAGES))
+        asyncio.run(provider.extract(_IMAGES))
     assert excinfo.value.__cause__ is None
     assert excinfo.value.__context__ is None
     # `__context__` is unset because the raise happens outside the `except`
@@ -246,7 +225,7 @@ def test_ask_exception_is_fully_detached_not_just_suppressed():
     """
     provider = _provider(_FakeLlmRaises(RuntimeError(f"body: {SENSITIVE_TEXT}")))
     with pytest.raises(OcrError) as excinfo:
-        asyncio.run(provider.classify_pages(_IMAGES))
+        asyncio.run(provider.extract(_IMAGES))
     assert excinfo.value.__cause__ is None
     assert excinfo.value.__context__ is None
     assert excinfo.value.__suppress_context__ is False
@@ -254,15 +233,14 @@ def test_ask_exception_is_fully_detached_not_just_suppressed():
 
 @pytest.mark.parametrize(
     "factory",
-    [_wrong_shape_classify, _wrong_shape_extract, _wrong_shape_extract_fields],
+    [_wrong_shape_extract, _wrong_shape_extract_fields],
 )
 def test_content_free_raise_sites_have_no_context_either(factory):
-    """The three shape-check raise sites (classify_pages/extract/
-    extract_fields "did not return a list/object") are never reached from
-    inside an active `except` block -- they only run after `_parse_json`
-    returns successfully -- so `__context__` is naturally `None` with no
-    explicit clearing needed. Confirmed here rather than merely asserted in
-    prose.
+    """The two shape-check raise sites (extract/extract_fields "did not
+    return a list/object") are never reached from inside an active `except`
+    block -- they only run after `_parse_json` returns successfully -- so
+    `__context__` is naturally `None` with no explicit clearing needed.
+    Confirmed here rather than merely asserted in prose.
     """
     with pytest.raises(OcrError) as excinfo:
         asyncio.run(factory())
@@ -288,24 +266,3 @@ def test_page_text_str_also_excludes_the_transcribed_text():
     assert SENSITIVE_ID not in str(page_text)
 
 
-def test_page_classification_repr_is_future_proofed():
-    classification = PageClassification(
-        page=1, kind=PageKind.body, starts_article=True, confidence=0.9
-    )
-    rendered = repr(classification)
-    assert "page=1" in rendered
-    assert "kind=" in rendered
-
-
-# --- Finding 5: body_pages dedupes -----------------------------------------
-
-
-def test_body_pages_deduplicates_repeated_page_numbers():
-    from legal_assistant.docgen.ocr.base import body_pages
-
-    classifications = [
-        PageClassification(2, PageKind.body, False, 0.9),
-        PageClassification(2, PageKind.body, False, 0.9),
-        PageClassification(1, PageKind.body, False, 0.9),
-    ]
-    assert body_pages(classifications) == [1, 2]

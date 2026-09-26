@@ -1,9 +1,8 @@
 """PDF -> per-page PNG, the only place PyMuPDF is used.
 
-Rendered twice at different DPI: a cheap pass so the model can classify
-every page, then a full-fidelity pass over the contract-body pages only.
-Paying full OCR price for bank certificates and blank backs is the single
-largest avoidable cost in the pipeline.
+Rendered for two purposes: a low-DPI thumbnail of one page per request
+(`pages.thumbnail`), and a full-fidelity render of only the pages the lawyer
+mapped.
 """
 
 from __future__ import annotations
@@ -25,7 +24,7 @@ _PYMUPDF_ERRORS = (ValueError, RuntimeError, fitz.mupdf.FzErrorBase)
 
 # A single rendered A4 page at 600 DPI is already ~4960x7015 px (~35M px,
 # ~140MB as an uncompressed RGB pixmap before PNG encoding) -- comfortably
-# above both of this project's configured render DPIs (docgen_classify_dpi=80,
+# above both of this project's configured render DPIs (docgen_thumbnail_dpi=60,
 # docgen_ocr_dpi=220 in Settings) so legitimate use is never affected, but
 # bounded so an attacker-controlled dpi on this untrusted-upload path cannot
 # force an arbitrarily large in-memory pixmap. This is well below PyMuPDF's

@@ -1,19 +1,16 @@
-"""Gemini-backed page classification, transcription, and field extraction.
+"""Gemini-backed transcription and field extraction.
 
-Three calls, each with a different job and a different cost profile:
+Two calls, each with a different job and a different cost profile:
 
-  classify_pages  -- one cheap low-DPI batch call over every page, so that
-                     bank certificates and blank backs never reach the
-                     expensive pass.
-  extract         -- one call per body page, transcribing VERBATIM. The
-                     prompt forbids correcting, completing, or reordering
-                     anything, because this text is quoted into a filed legal
-                     document as "المادة السادسة قبل التعديل".
+  extract         -- one call per page in the lawyer's page map, transcribing
+                     VERBATIM. The prompt forbids correcting, completing, or
+                     reordering anything, because this text is quoted into a
+                     filed legal document as "المادة السادسة قبل التعديل".
   extract_fields  -- the سجل تجاري, read against a JSON schema (one property
                      per numbered box). Read as free text, that 14-box
                      landscape form under a guilloche comes back scrambled.
 
-All three run at temperature=0 via the shared `get_llm` factory.
+Both run at temperature=0 via the shared `get_llm` factory.
 """
 
 from __future__ import annotations
@@ -24,28 +21,9 @@ import json
 from collections.abc import Sequence
 
 from legal_assistant.config import Settings, get_settings
-from legal_assistant.docgen.ocr.base import (
-    OcrError,
-    PageClassification,
-    PageKind,
-    PageText,
-)
+from legal_assistant.docgen.ocr.base import OcrError, PageText
 from legal_assistant.docgen.pdf import PageImage
 from legal_assistant.llm import get_llm
-
-_CLASSIFY_PROMPT = """أنت تصنّف صفحات ملف ممسوح ضوئيا لعقد تأسيس شركة مصرية.
-
-لكل صفحة، حدد:
-- kind: "body" إذا كانت الصفحة جزءا من نص العقد أو النظام الأساسي نفسه،
-  أو "attachment" إذا كانت مستندا مرفقا (شهادة بنكية، إيصال، صورة مستند)،
-  أو "signature" إذا كانت صفحة توقيعات أو أختام فقط بلا نص مواد،
-  أو "unknown" إذا لم تستطع التحديد.
-- starts_article: true إذا كانت الصفحة تبدأ بعنوان مادة (مثل «المادة (٦)»).
-- confidence: رقم بين 0 و 1.
-
-أعد JSON فقط، مصفوفة بنفس ترتيب الصفحات المعطاة:
-[{"page": <رقم الصفحة>, "kind": "...", "starts_article": true|false, "confidence": 0.0}]
-"""
 
 _EXTRACT_PROMPT = """انسخ نص هذه الصفحة من عقد التأسيس نسخا حرفيا كاملا.
 
@@ -182,42 +160,6 @@ class GeminiOcrProvider:
         if error_type_name is not None:
             raise OcrError(f"OCR provider call failed: {error_type_name}")
         return _text_of(response.content)
-
-    async def classify_pages(
-        self, images: Sequence[PageImage]
-    ) -> list[PageClassification]:
-        if not images:
-            return []
-        pages = ", ".join(str(i.page) for i in images)
-        raw = await self._ask(f"{_CLASSIFY_PROMPT}\nأرقام الصفحات بالترتيب: {pages}", images)
-        payload = _parse_json(raw, source="classify_pages")
-        if not isinstance(payload, list):
-            # Not raised from an active exception (no `from e`/implicit
-            # context to worry about), and the message names no document
-            # content -- explicit `from None` just documents that.
-            raise OcrError("page classification did not return a list") from None
-
-        by_page = {}
-        for item in payload:
-            if not isinstance(item, dict) or "page" not in item:
-                continue
-            try:
-                kind = PageKind(item.get("kind", "unknown"))
-            except ValueError:
-                kind = PageKind.unknown
-            by_page[int(item["page"])] = PageClassification(
-                page=int(item["page"]),
-                kind=kind,
-                starts_article=bool(item.get("starts_article", False)),
-                confidence=float(item.get("confidence", 0.0)),
-            )
-
-        # A page the model skipped is `unknown`, not silently dropped -- the
-        # caller must see that every uploaded page was accounted for.
-        return [
-            by_page.get(i.page, PageClassification(i.page, PageKind.unknown, False, 0.0))
-            for i in images
-        ]
 
     async def extract(self, images: Sequence[PageImage]) -> list[PageText]:
         """Transcribe each page verbatim. Pages are processed concurrently."""

@@ -4,11 +4,12 @@ import datetime
 import pytest
 
 from legal_assistant.docgen import pdf, service, storage
-from legal_assistant.docgen.models import DocgenSession, DocgenUpload
-from legal_assistant.docgen.ocr.base import PageClassification, PageKind, PageText
-from legal_assistant.docgen.parsing import sections
-from legal_assistant.docgen.parsing.articles import ExtractedArticle
+from legal_assistant.docgen.models import DocgenArticle, DocgenFields, DocgenSession, DocgenUpload
+from legal_assistant.docgen.numbering import ArticleRef
+from legal_assistant.docgen.ocr.base import PageText
+from legal_assistant.docgen.pages import Entry, PageMap
 from legal_assistant.docgen.parsing.commercial_register import CompanyRecord
+from legal_assistant.docgen.parsing.scoped import AoaExtraction
 from legal_assistant.docgen.parsing.signatures import Concept
 from legal_assistant.docgen.patching import Replacement
 from legal_assistant.docgen.service import (
@@ -60,6 +61,16 @@ def _days_ago(n: int) -> datetime.datetime:
 
 def _days_from_now(n: int) -> datetime.datetime:
     return datetime.datetime.now(datetime.UTC) + datetime.timedelta(days=n)
+
+
+def _page_map():
+    return PageMap(
+        entries={
+            "company_name": Entry("company_name", 1, 1, ArticleRef(1)),
+            "company_address": Entry("company_address", 2, 2, ArticleRef(5)),
+        },
+        amended=[Entry("amended:0", 3, 3, ArticleRef(7))],
+    )
 
 
 def _session(**overrides) -> DocgenSession:
@@ -431,47 +442,38 @@ def test_run_ocr_persist_step_abandons_the_result_when_the_session_expires_mid_r
     # one -- and the session must not be written to if it closed during that
     # window: no new DocgenArticle/DocgenFields content, and no `ready`.
     session = _session(id=1, status="ocr_running", expires_at=_days_from_now(1))
+    session.page_map = _page_map().to_json()
+    session.articles = []
+    session.fields = DocgenFields(session_id=1, data={})
     aoa_upload = DocgenUpload(
-        id=10, session_id=1, kind="aoa", filename="a.pdf", storage_key="k1"
+        id=10, session_id=1, kind="aoa", filename="a.pdf", storage_key="k1", ocr_pages=None
     )
     session.uploads = [aoa_upload]
     db = _FakeRunOcrDb(session)
 
     class _FakeSettings:
-        docgen_classify_dpi = 72
         docgen_ocr_dpi = 150
 
     class _FakeProvider:
-        async def classify_pages(self, images):
-            return [
-                PageClassification(
-                    page=1, kind=PageKind.body, starts_article=True, confidence=1.0
-                )
-            ]
-
         async def extract(self, images):
             # The window closes DURING this external OCR call -- after the
             # Fix-3 claim, before the persist step below ever loads the row.
             session.expires_at = _days_ago(1)
-            return [PageText(page=1, text="نص المادة الأولى.", confidence=0.9)]
+            return [PageText(page=p, text="نص", confidence=0.9) for p in (1, 2, 3)]
 
-    async def fake_extract_fields(provider, source_mode, uploads, articles, settings):
-        return CompanyRecord(), {}
+        async def extract_fields(self, images, schema):
+            return {}
+
+    def fake_extract_aoa(page_texts, page_map, company_type):
+        return AoaExtraction()
 
     monkeypatch.setattr(service, "get_settings", lambda: _FakeSettings())
     monkeypatch.setattr(service, "get_provider", lambda settings: _FakeProvider())
     monkeypatch.setattr(service, "get_sessionmaker", lambda: (lambda: db))
-    monkeypatch.setattr(service, "_extract_fields", fake_extract_fields)
+    monkeypatch.setattr(service, "extract_aoa", fake_extract_aoa)
     monkeypatch.setattr(storage, "read", lambda key: b"%PDF-fake%")
-    monkeypatch.setattr(pdf, "render_pages", lambda data, dpi=None, pages=None: ["thumb"])
-    monkeypatch.setattr(sections, "split_instruments", lambda text: ["instrument"])
     monkeypatch.setattr(
-        sections,
-        "select_target",
-        lambda instruments, company_type: (
-            [ExtractedArticle(number=1, heading="المادة الأولى", body="نص", start=0, end=3)],
-            None,
-        ),
+        pdf, "render_pages", lambda data, dpi=None, pages=None: ["thumb"] * len(pages or [1])
     )
 
     asyncio.run(service._run_ocr(1))
@@ -596,3 +598,70 @@ def test_validate_source_mode_accepts_a_complete_aoa_plus_cr_session():
     validate_source_mode(
         "aoa_plus_cr", uploaded_kinds={"aoa", "commercial_register"}, typed_cr_no=None
     )
+
+
+def test_merge_fields_records_span_article_and_flags():
+    aoa = AoaExtraction(
+        values={"company_name": "انجاز", "company_address": None},
+        flags={"company_name": [], "company_address": ["article_not_found"]},
+    )
+    _record, prov = service.merge_fields(aoa, CompanyRecord(), {}, _page_map())
+    assert prov["company_name"]["span"] == {"from": 1, "to": 1}
+    assert prov["company_name"]["article"] == "1"
+    assert prov["company_address"]["flags"] == ["article_not_found"]
+    assert prov["company_address"]["value"] is None
+
+
+def test_merge_fields_never_overwrites_a_lawyer_correction():
+    previous = {"company_name": {"value": "مصحح", "source": "user"}}
+    aoa = AoaExtraction(values={"company_name": "انجاز"}, flags={"company_name": []})
+    _record, prov = service.merge_fields(aoa, CompanyRecord(), previous, _page_map())
+    assert prov["company_name"] == previous["company_name"]
+
+
+def test_merge_fields_keeps_the_cr_conflict_rule():
+    aoa = AoaExtraction(values={"company_name": "انجاز"}, flags={"company_name": []})
+    cr = CompanyRecord(company_name="انجاز للمقاولات")
+    _record, prov = service.merge_fields(aoa, cr, {}, _page_map())
+    assert prov["company_name"]["value"] == "انجاز للمقاولات"
+    assert prov["company_name"]["conflict"] == {"cr": "انجاز للمقاولات", "aoa": "انجاز"}
+
+
+def test_merge_fields_keeps_a_lawyer_edited_roster():
+    previous = {"attendees": [{"name": "مصحح"}], "attendees_edited": True}
+    _record, prov = service.merge_fields(AoaExtraction(), CompanyRecord(), previous, _page_map())
+    assert prov["attendees"] == [{"name": "مصحح"}]
+
+
+def _row(number, first, last, mukarrar=False, new_text=None):
+    return DocgenArticle(
+        article_number=number, is_mukarrar=mukarrar, span_first=first, span_last=last,
+        new_text=new_text,
+    )
+
+
+def test_carry_over_keeps_an_unchanged_row_and_its_edits():
+    kept = _row(7, 3, 3, new_text="جديد")
+    [(_entry, row, new_text)] = service.carry_over(_page_map().amended, [kept])
+    assert row is kept and new_text is None
+
+
+def test_carry_over_rebuilds_on_a_changed_span_but_keeps_new_text():
+    [(_entry, row, new_text)] = service.carry_over(
+        _page_map().amended, [_row(7, 3, 4, new_text="جديد")]
+    )
+    assert row is None and new_text == "جديد"
+
+
+def test_carry_over_never_matches_mukarrar_to_its_base():
+    [(_entry, row, new_text)] = service.carry_over(
+        _page_map().amended, [_row(7, 3, 3, mukarrar=True, new_text="x")]
+    )
+    assert row is None and new_text is None
+
+
+def test_claim_for_ocr_statement_requires_a_submitted_page_map():
+    sql = str(
+        service._claim_for_ocr_statement(1).compile(compile_kwargs={"literal_binds": True})
+    )
+    assert "page_map IS NOT NULL" in sql

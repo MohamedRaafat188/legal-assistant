@@ -5,7 +5,7 @@ from __future__ import annotations
 import datetime
 import re
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 _USERNAME_RE = re.compile(r"^[a-zA-Z0-9_.-]{3,32}$")
 
@@ -115,6 +115,7 @@ class DocgenSessionOut(BaseModel):
     created_at: datetime.datetime
     updated_at: datetime.datetime
     expires_at: datetime.datetime
+    page_map: dict | None = None
 
 
 class DocgenUploadOut(BaseModel):
@@ -122,19 +123,23 @@ class DocgenUploadOut(BaseModel):
     kind: str
     filename: str
     page_count: int | None
-    page_classification: list | None
 
 
 class DocgenArticleOut(BaseModel):
+    position: int
     article_number: int
+    is_mukarrar: bool
     ordinal_words: str
     article_name: str
+    status: str
+    span_first: int | None
+    span_last: int | None
+    possibly_truncated: bool
     source_text: str
     patched_text: str
     patch_ops: list | None
     confidence: float | None
     needs_review: bool
-    selected: bool
     new_text: str | None
 
 
@@ -150,9 +155,23 @@ class DocgenFieldsPatchRequest(BaseModel):
 
 
 class DocgenArticlePatchRequest(BaseModel):
-    selected: bool | None = None
     patched_text: str | None = None
     new_text: str | None = None
+
+
+class DocgenPageMapEntry(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    first: int = Field(alias="from")
+    to: int
+    # A number ("6", "٦ مكرر") or "التمهيد". Validated by docgen.pages, not here,
+    # so every problem comes back together in one Arabic 422.
+    article: str
+
+
+class DocgenPageMapRequest(BaseModel):
+    entries: dict[str, DocgenPageMapEntry]
+    amended: list[DocgenPageMapEntry]
 
 
 class DocgenAttendee(BaseModel):

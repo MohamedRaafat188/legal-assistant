@@ -1,19 +1,9 @@
 import pytest
 
-from legal_assistant.docgen.ocr.base import (
-    OcrProvider,
-    PageClassification,
-    PageKind,
-    PageText,
-    body_pages,
-    get_provider,
-)
+from legal_assistant.docgen.ocr.base import OcrProvider, PageText, get_provider
 
 
 class FakeProvider:
-    async def classify_pages(self, images):
-        return [PageClassification(i.page, PageKind.body, True, 1.0) for i in images]
-
     async def extract(self, images):
         return [PageText(i.page, "نص", 1.0) for i in images]
 
@@ -44,17 +34,3 @@ def test_get_provider_rejects_an_unknown_provider_name(monkeypatch):
     with pytest.raises(ValueError) as excinfo:
         get_provider()
     assert "tesseract" in str(excinfo.value)
-
-
-def test_body_pages_keeps_only_body_pages_in_order():
-    classifications = [
-        PageClassification(3, PageKind.body, True, 0.9),
-        PageClassification(1, PageKind.attachment, False, 0.9),
-        PageClassification(2, PageKind.body, False, 0.9),
-        PageClassification(4, PageKind.signature, False, 0.9),
-    ]
-    assert body_pages(classifications) == [2, 3]
-
-
-def test_body_pages_of_an_empty_classification_is_empty():
-    assert body_pages([]) == []

@@ -2,9 +2,9 @@
 
 Sessions are resumable, so everything the review screen shows survives a
 reload: extracted articles with their patch ops and confidence, identity
-fields with their provenance, and the page classification that produced
-them. Uploaded FILES live on disk under `storage_key`, never in the DB --
-they carry national ID and passport numbers and are purged after two days.
+fields with their provenance, and the page map that produced them. Uploaded
+FILES live on disk under `storage_key`, never in the DB -- they carry
+national ID and passport numbers and are purged after two days.
 """
 
 from __future__ import annotations
@@ -67,6 +67,8 @@ class DocgenSession(Base):
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
     )
     expires_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    # The lawyer's validated map (`pages.PageMap.to_json()`); None until submitted.
+    page_map: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
 
     uploads: Mapped[list[DocgenUpload]] = relationship(
         back_populates="session", cascade="all, delete-orphan"
@@ -74,7 +76,7 @@ class DocgenSession(Base):
     articles: Mapped[list[DocgenArticle]] = relationship(
         back_populates="session",
         cascade="all, delete-orphan",
-        order_by="DocgenArticle.article_number",
+        order_by="DocgenArticle.position",
     )
     fields: Mapped[DocgenFields | None] = relationship(
         back_populates="session", cascade="all, delete-orphan", uselist=False
@@ -98,8 +100,9 @@ class DocgenUpload(Base):
     # Opaque, non-guessable, never returned to the client.
     storage_key: Mapped[str] = mapped_column(String(128), nullable=False)
     page_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    # [{page, kind, starts_article, confidence}] from the cheap classify pass.
-    page_classification: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+    # per-page OCR cache, so a page-map edit only pays for new pages; purged
+    # with the session.
+    ocr_pages: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -126,13 +129,23 @@ class DocgenArticle(Base):
     patch_ops: Mapped[list | None] = mapped_column(JSONB, nullable=True)
     confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
     needs_review: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
-    selected: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
     new_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Order the lawyer declared the amended articles in (0-based). The API
+    # addresses an article by this: ٦ and ٦ مكرر share the number 6.
+    position: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    is_mukarrar: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    # found | not_found | ambiguous -- parsing.articles.LookupStatus
+    status: Mapped[str] = mapped_column(String(16), nullable=False, server_default="found")
+    span_first: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    span_last: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    possibly_truncated: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="false"
+    )
 
     session: Mapped[DocgenSession] = relationship(back_populates="articles")
 
     __table_args__ = (
-        Index("ix_docgen_articles_session_id_article_number", "session_id", "article_number"),
+        Index("ix_docgen_articles_session_id_position", "session_id", "position"),
     )
 
 

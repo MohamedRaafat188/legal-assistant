@@ -1,9 +1,11 @@
 """docgen endpoints: upload a عقد, review what was extracted, render the قرار.
 
-OCR runs as a background task with status polling rather than SSE: unlike
-/chat there is nothing to stream, and the job outlives the request. Every
-route resolves the session through `service.get_session`, which filters on
-user_id in the query -- ownership is never checked after the fact.
+OCR is queued by the page-map route, not by upload: the lawyer's submitted
+page map is what tells `run_ocr_job` which pages to OCR and where each value
+lives. It runs as a background task with status polling rather than SSE:
+unlike /chat there is nothing to stream, and the job outlives the request.
+Every route resolves the session through `service.get_session`, which
+filters on user_id in the query -- ownership is never checked after the fact.
 """
 
 from __future__ import annotations
@@ -27,6 +29,7 @@ from legal_assistant.api.schemas import (
     DocgenArticlePatchRequest,
     DocgenAttendeesPatchRequest,
     DocgenFieldsPatchRequest,
+    DocgenPageMapRequest,
     DocgenSessionCreateRequest,
     DocgenSessionDetailOut,
     DocgenSessionOut,
@@ -58,22 +61,26 @@ def _session_out(session: DocgenSession) -> DocgenSessionOut:
         created_at=session.created_at,
         updated_at=session.updated_at,
         expires_at=session.expires_at,
+        page_map=session.page_map,
     )
 
 
 def _article_out(a) -> DocgenArticleOut:
     return DocgenArticleOut(
+        position=a.position,
         article_number=a.article_number,
+        is_mukarrar=a.is_mukarrar,
         ordinal_words=a.ordinal_words,
-        article_name=article_name(a.article_number)
-        if 1 <= a.article_number <= 99
-        else f"المادة {a.article_number}",
+        article_name=article_name(a.article_number, a.is_mukarrar),
+        status=a.status,
+        span_first=a.span_first,
+        span_last=a.span_last,
+        possibly_truncated=a.possibly_truncated,
         source_text=a.source_text,
         patched_text=a.patched_text,
         patch_ops=a.patch_ops,
         confidence=a.confidence,
         needs_review=a.needs_review,
-        selected=a.selected,
         new_text=a.new_text,
     )
 
@@ -87,7 +94,6 @@ def _detail_out(session: DocgenSession) -> DocgenSessionDetailOut:
                 kind=u.kind,
                 filename=u.filename,
                 page_count=u.page_count,
-                page_classification=u.page_classification,
             )
             for u in session.uploads
         ],
@@ -120,11 +126,10 @@ async def create_session_route(
 @router.post(
     "/sessions/{session_id}/uploads",
     response_model=DocgenUploadOut,
-    status_code=status.HTTP_202_ACCEPTED,
+    status_code=status.HTTP_201_CREATED,
 )
 async def upload_route(
     session_id: int,
-    background: BackgroundTasks,
     kind: str = Form(...),
     file: UploadFile = File(...),
     user_id: int = Depends(get_current_user_id),
@@ -149,18 +154,11 @@ async def upload_route(
         # `service._fail_stage`), so it is safe to surface verbatim.
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
 
-    # Queue OCR only once the عقد itself is present; a سجل uploaded first
-    # would otherwise start a job with nothing to segment.
-    kinds = {u.kind for u in session.uploads} | {kind}
-    if "aoa" in kinds:
-        background.add_task(service.run_ocr_job, session.id)
-
     return DocgenUploadOut(
         id=upload.id,
         kind=upload.kind,
         filename=upload.filename,
         page_count=upload.page_count,
-        page_classification=upload.page_classification,
     )
 
 
@@ -171,6 +169,47 @@ async def get_session_route(
     db: AsyncSession = Depends(get_db_session),
 ) -> DocgenSessionDetailOut:
     return _detail_out(await _load(db, session_id, user_id))
+
+
+@router.put("/sessions/{session_id}/page-map", response_model=DocgenSessionDetailOut)
+async def put_page_map_route(
+    session_id: int,
+    body: DocgenPageMapRequest,
+    background: BackgroundTasks,
+    user_id: int = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db_session),
+) -> DocgenSessionDetailOut:
+    session = await _load(db, session_id, user_id)
+    try:
+        await service.submit_page_map(db, session, body.model_dump(by_alias=True))
+    except service.PageMapError as e:
+        # Lawyer-entered page/article numbers and fixed Arabic text only.
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=e.problems
+        ) from e
+    except service.SessionStateError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
+    background.add_task(service.run_ocr_job, session.id)
+    return _detail_out(await _load(db, session_id, user_id))
+
+
+@router.get("/sessions/{session_id}/uploads/{upload_id}/pages/{page}")
+async def thumbnail_route(
+    session_id: int,
+    upload_id: int,
+    page: int,
+    user_id: int = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db_session),
+) -> Response:
+    session = await _load(db, session_id, user_id)
+    try:
+        png = service.thumbnail(session, upload_id, page)
+    except service.SessionNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+    except service._StageError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+    # The page carries national IDs: never let a browser or proxy keep it.
+    return Response(content=png, media_type="image/png", headers={"Cache-Control": "no-store"})
 
 
 @router.patch("/sessions/{session_id}/fields", response_model=DocgenSessionDetailOut)
@@ -186,11 +225,11 @@ async def patch_fields_route(
 
 
 @router.patch(
-    "/sessions/{session_id}/articles/{article_number}", response_model=DocgenArticleOut
+    "/sessions/{session_id}/articles/{position}", response_model=DocgenArticleOut
 )
 async def patch_article_route(
     session_id: int,
-    article_number: int,
+    position: int,
     body: DocgenArticlePatchRequest,
     user_id: int = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db_session),
@@ -198,12 +237,7 @@ async def patch_article_route(
     session = await _load(db, session_id, user_id)
     try:
         article = await service.update_article(
-            db,
-            session,
-            article_number,
-            selected=body.selected,
-            patched_text=body.patched_text,
-            new_text=body.new_text,
+            db, session, position, patched_text=body.patched_text, new_text=body.new_text
         )
     except service.SessionNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e

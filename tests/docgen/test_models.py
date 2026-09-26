@@ -33,6 +33,7 @@ def test_session_columns():
         "created_at",
         "updated_at",
         "expires_at",
+        "page_map",
     }
 
 
@@ -56,7 +57,8 @@ def test_session_cascades_from_users():
 def test_jsonb_columns_are_jsonb():
     from sqlalchemy.dialects.postgresql import JSONB
 
-    assert isinstance(inspect(DocgenUpload).columns["page_classification"].type, JSONB)
+    assert isinstance(inspect(DocgenUpload).columns["ocr_pages"].type, JSONB)
+    assert isinstance(inspect(DocgenSession).columns["page_map"].type, JSONB)
     assert isinstance(inspect(DocgenArticle).columns["patch_ops"].type, JSONB)
     assert isinstance(inspect(DocgenFields).columns["data"].type, JSONB)
 
@@ -87,4 +89,16 @@ def test_articles_are_indexed_by_session_and_number():
     index_columns = {
         tuple(c.name for c in index.columns) for index in inspect(DocgenArticle).local_table.indexes
     }
-    assert ("session_id", "article_number") in index_columns
+    assert ("session_id", "position") in index_columns
+
+
+def test_articles_carry_the_page_map_columns():
+    cols = inspect(DocgenArticle).columns
+    for name in ("position", "is_mukarrar", "status", "span_first", "span_last",
+                 "possibly_truncated"):
+        assert name in cols
+    assert "selected" not in cols
+
+
+def test_session_articles_are_ordered_by_declared_position():
+    assert "position" in str(DocgenSession.articles.property.order_by[0])

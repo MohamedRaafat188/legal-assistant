@@ -1,22 +1,4 @@
-from legal_assistant.docgen.parsing.articles import segment_articles
-from legal_assistant.docgen.parsing.signatures import Concept, classify, find_article, states
-
-
-def test_finds_head_office_at_article_5_in_the_zmm_sample(zmm_text):
-    article = find_article(segment_articles(zmm_text), Concept.HEAD_OFFICE)
-    assert article is not None
-    assert article.number == 5
-
-
-def test_finds_head_office_at_article_6_in_the_shakhs_wahed_sample(shakhs_wahed_text):
-    article = find_article(segment_articles(shakhs_wahed_text), Concept.HEAD_OFFICE)
-    assert article is not None
-    assert article.number == 6
-
-
-def test_finds_capital_at_the_right_number_in_each_sample(zmm_text, shakhs_wahed_text):
-    assert find_article(segment_articles(zmm_text), Concept.CAPITAL).number == 6
-    assert find_article(segment_articles(shakhs_wahed_text), Concept.CAPITAL).number == 7
+from legal_assistant.docgen.parsing.signatures import Concept, classify, states
 
 
 def test_classify_ignores_hamza_and_ya_spelling_variants():
@@ -36,16 +18,6 @@ def test_classify_returns_none_for_an_unrecognised_article():
 
     body = "تسرى على هذه الشركة أحكام القانون ولائحته التنفيذية."
     assert classify(ExtractedArticle(20, "المادة (٢٠)", body, 0, len(body))) is None
-
-
-def test_find_article_returns_none_when_absent():
-    assert find_article([], Concept.CAPITAL) is None
-
-
-def test_find_article_prefers_the_earliest_match(zmm_text):
-    articles = segment_articles(zmm_text)
-    duration = find_article(articles, Concept.DURATION)
-    assert duration is not None and duration.number == 7
 
 
 def test_states_matches_the_one_word_raasmal_spelling():
