@@ -34,3 +34,43 @@ def test_get_provider_rejects_an_unknown_provider_name(monkeypatch):
     with pytest.raises(ValueError) as excinfo:
         get_provider()
     assert "tesseract" in str(excinfo.value)
+
+
+def test_gemini_extract_keeps_page_margins_out_of_the_text():
+    import asyncio
+    import json
+
+    from legal_assistant.docgen.ocr.gemini import GeminiOcrProvider
+    from legal_assistant.docgen.pdf import PageImage
+
+    provider = GeminiOcrProvider.__new__(GeminiOcrProvider)
+
+    async def ask(_prompt, _images):
+        return json.dumps(
+            {"text": "المادة (٦)\nنص المادة", "margins": "F-ISS/A-01-10\nCamScanner",
+             "confidence": 0.9},
+            ensure_ascii=False,
+        )
+
+    provider._ask = ask
+    [page] = asyncio.run(provider.extract([PageImage(page=2, png=b"")]))
+    assert page.text == "المادة (٦)\nنص المادة"
+    assert page.margins == "F-ISS/A-01-10\nCamScanner"
+    assert "CamScanner" not in repr(page)
+
+
+def test_gemini_extract_tolerates_a_response_without_margins():
+    import asyncio
+    import json
+
+    from legal_assistant.docgen.ocr.gemini import GeminiOcrProvider
+    from legal_assistant.docgen.pdf import PageImage
+
+    provider = GeminiOcrProvider.__new__(GeminiOcrProvider)
+
+    async def ask(_prompt, _images):
+        return json.dumps({"text": "نص", "confidence": 0.9}, ensure_ascii=False)
+
+    provider._ask = ask
+    [page] = asyncio.run(provider.extract([PageImage(page=1, png=b"")]))
+    assert page.margins == ""

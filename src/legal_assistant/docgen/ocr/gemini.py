@@ -41,7 +41,12 @@ _EXTRACT_PROMPT = """انسخ نص هذه الصفحة من عقد التأسي�
   سطرين فاجمعهما في خلية واحدة.
 - لا تضف أي شرح أو تعليق أو ترجمة.
 
-أعد JSON فقط: {"text": "...", "confidence": 0.0}
+- ضع في "margins" -- لا في "text" -- كل ما هو خارج متن العقد: ترويسة الصفحة
+  وتذييلها، ورقم الصفحة، وأكواد النماذج والمستندات، وشعار أو علامة تطبيق
+  المسح الضوئي (مثل CamScanner). انسخه أيضا حرفيا كما هو.
+- كل ما عدا ذلك من نص الصفحة يوضع في "text".
+
+أعد JSON فقط: {"text": "...", "margins": "...", "confidence": 0.0}
 """
 
 _FIELDS_PROMPT = """استخرج البيانات التالية من مستخرج السجل التجارى المرفق.
@@ -184,6 +189,7 @@ class GeminiOcrProvider:
             return PageText(
                 page=image.page,
                 text=str(payload.get("text", "")),
+                margins=str(payload.get("margins") or ""),
                 confidence=float(payload.get("confidence", 0.0)),
             )
 

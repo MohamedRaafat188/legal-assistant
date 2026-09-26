@@ -147,8 +147,22 @@ def placeholders_in(path: pathlib.Path) -> set[str]:
     with zipfile.ZipFile(path) as archive:
         for name in archive.namelist():
             if _SCANNED_PART.fullmatch(name):
-                found.update(_VAR.findall(archive.read(name).decode("utf-8")))
+                found.update(_VAR.findall(_paragraph_text(archive.read(name).decode("utf-8"))))
     return found
+
+
+_PARAGRAPH = re.compile(r"<w:p[ >].*?</w:p>", re.S)
+_TEXT_RUN = re.compile(r"<w:t(?: [^>]*)?>([^<]*)</w:t>")
+
+
+def _paragraph_text(xml: str) -> str:
+    """Each paragraph's text, one per line. Word splits `{{ name }}` across
+    runs (and spell-check markers) whenever a template is edited and saved;
+    docxtpl joins them back when rendering, so the scan must read the joined
+    text too, not the raw XML."""
+    return "\n".join(
+        "".join(_TEXT_RUN.findall(paragraph)) for paragraph in _PARAGRAPH.findall(xml)
+    )
 
 
 def verify_all() -> None:

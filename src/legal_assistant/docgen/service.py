@@ -857,7 +857,9 @@ async def _run_ocr(session_id: int) -> None:
         )
         texts = await _run_stage_async("التعرف الضوئى على نص العقد", provider.extract(images))
         for text in texts:
-            cache[text.page] = {"text": text.text, "confidence": text.confidence}
+            cache[text.page] = {
+                "text": text.text, "margins": text.margins, "confidence": text.confidence
+            }
     page_texts = {p: v["text"] for p, v in cache.items()}
 
     # 2. Scoped extraction: each entry sees only its span + article.

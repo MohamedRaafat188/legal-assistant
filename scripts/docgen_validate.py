@@ -328,7 +328,11 @@ async def run(
 
         text = document_text(document)
         results.append(_report("no placeholder residue", "{{" not in text and "{%" not in text))
-        results.append(_report("قبل التعديل text present", target.patched_text[:30] in text))
+        # Rendering joins the scan's line wraps, so compare whitespace-normalized.
+        flat = " ".join(text.split())
+        before = " ".join(target.patched_text.split())[:30]
+        results.append(_report("قبل التعديل text present", before in flat))
+        results.append(_report("no markdown table pipes left", "|" not in text))
         results.append(_report("بعد التعديل text present", "النص الجديد للمادة." in text))
 
         output = pathlib.Path(f"docgen-validate-{session_id}.docx")

@@ -25,6 +25,10 @@ class PageText:
     page: int
     text: str
     confidence: float
+    # Page furniture kept out of `text`: running header/footer, page number,
+    # form codes, the scanner app's logo. Kept verbatim for audit; never part
+    # of an article.
+    margins: str = ""
 
     # `text` is transcribed document content -- possibly a partner's national
     # ID or passport number, copied verbatim per the extraction prompt. The
@@ -33,7 +37,7 @@ class PageText:
     def __repr__(self) -> str:
         return (
             f"PageText(page={self.page!r}, text=<{len(self.text)} chars>, "
-            f"confidence={self.confidence!r})"
+            f"margins=<{len(self.margins)} chars>, confidence={self.confidence!r})"
         )
 
 
