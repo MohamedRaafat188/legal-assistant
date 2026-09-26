@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import datetime
 import logging
-import re
 from collections.abc import Coroutine, Sequence
 from typing import Any, NoReturn, TypeVar
 
@@ -58,6 +57,7 @@ from legal_assistant.docgen.parsing.commercial_register import (
     split_capital,
 )
 from legal_assistant.docgen.parsing.signatures import Concept, classify, find_article
+from legal_assistant.docgen.parsing.values import current_value as _current_value
 from legal_assistant.docgen.patching import PatchResult, Replacement, patch_article
 from legal_assistant.docgen.pdf import InvalidPdfError
 from legal_assistant.docgen.render import (
@@ -128,24 +128,6 @@ def plan_patches(
             source="cr",
         )
     ]
-
-
-def _current_value(field_name: str, article_text: str) -> str:
-    """The article's own rendering of a field, as a verbatim span.
-
-    Returns "" when it cannot be isolated, which makes the replacement a
-    silent no-op rather than a guess.
-    """
-    if field_name == "capital":
-        match = re.search(r"[0-9٠-٩][0-9٠-٩,.]*", article_text)
-        return match.group(0) if match else ""
-    if field_name == "company_address":
-        match = re.search(r"(?:الكائن|الكائنة|مقرها)\s*(?:فى|في|ب)?\s*(?P<v>[^.\n]+)", article_text)
-        return match.group("v").strip() if match else ""
-    if field_name == "company_name":
-        match = re.search(r"(?:اسم الشركة|تسمى الشركة)\s*(?:هو|:)?\s*(?P<v>[^.\n]+)", article_text)
-        return match.group("v").strip() if match else ""
-    return ""
 
 
 def apply_patches(text: str, replacements: Sequence[Replacement]) -> PatchResult:

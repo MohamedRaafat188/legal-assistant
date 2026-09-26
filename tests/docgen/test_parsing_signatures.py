@@ -1,5 +1,5 @@
 from legal_assistant.docgen.parsing.articles import segment_articles
-from legal_assistant.docgen.parsing.signatures import Concept, classify, find_article
+from legal_assistant.docgen.parsing.signatures import Concept, classify, find_article, states
 
 
 def test_finds_head_office_at_article_5_in_the_zmm_sample(zmm_text):
@@ -46,3 +46,15 @@ def test_find_article_prefers_the_earliest_match(zmm_text):
     articles = segment_articles(zmm_text)
     duration = find_article(articles, Concept.DURATION)
     assert duration is not None and duration.number == 7
+
+
+def test_states_matches_the_one_word_raasmal_spelling():
+    assert states("رأسمال الشركة مائة ألف جنيه", Concept.CAPITAL)
+
+
+def test_states_matches_mawtinuha_al_qanuni():
+    assert states("يكون موطنها القانوني في القاهرة", Concept.HEAD_OFFICE)
+
+
+def test_states_rejects_an_unrelated_text():
+    assert not states("مدة الشركة خمس وعشرون سنة", Concept.HEAD_OFFICE)

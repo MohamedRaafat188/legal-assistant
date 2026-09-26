@@ -36,6 +36,7 @@ class CompanyRecord:
     law_number: str | None = None
     law_year: str | None = None
     company_address: str | None = None
+    owner_name: str | None = None
     capital: str | None = None
     # رأس المال المصدر. Equals `capital` for ذ.م.م and شخص واحد, which state a
     # single figure; differs for مساهمة, whose quorum is computed from المصدر.
@@ -68,6 +69,10 @@ CR_FIELD_SCHEMA: dict = {
         "company_address": {
             "type": "string",
             "description": "عنوان المحل الرئيسى من الخانة (6)",
+        },
+        "owner_name": {
+            "type": "string",
+            "description": "اسم صاحب الشركة (لشركات الشخص الواحد) من الخانة (3)",
         },
         "capital": {"type": "string", "description": "رأس المال من الخانة (9)"},
         "issued_capital": {
@@ -135,6 +140,7 @@ def record_from_payload(payload: Mapping) -> CompanyRecord:
         law_number=_clean(payload.get("law_number")),
         law_year=_clean(payload.get("law_year")),
         company_address=_clean(payload.get("company_address")),
+        owner_name=_clean(payload.get("owner_name")),
         capital=_clean(payload.get("capital")),
         issued_capital=_clean(payload.get("issued_capital")),
         parties=parties,
@@ -211,7 +217,11 @@ def parse_party_table(text: str) -> list[Party]:
     for line in text.splitlines():
         if not started:
             # The roster begins after the "وزعت على الشركاء كالآتى" style lead-in.
-            if re.search(r"(الشركاء|المساهمين|المؤسسين)\s*(كالآتى|كالاتى|كالتالى|:)", line):
+            if re.search(
+                r"(الشركاء|المساهمين|المؤسسين|مؤسس الشركة)\s*"
+                r"(كالآتى|كالاتى|كالتالى|:|على الوجه الآت[يى]|على الوجه الات[يى])",
+                line,
+            ):
                 started = True
             continue
 

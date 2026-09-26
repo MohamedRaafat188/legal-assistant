@@ -74,6 +74,7 @@ def test_schema_covers_every_record_field():
         "law_number",
         "law_year",
         "company_address",
+        "owner_name",
         "capital",
         "issued_capital",
         "parties",
@@ -177,3 +178,12 @@ def test_parse_party_table_skips_a_whitespace_only_line_inside_the_roster():
     )
     parties = parse_party_table(text)
     assert [p.name for p in parties] == ["مايكل فوزى", "مايكل مجدى"]
+
+
+def test_party_table_lead_in_ala_al_wajh_al_ati():
+    text = "وزع رأس المال على الشركاء على الوجه الآتي:\nأحمد محمود ٥٠ حصة ٥٠٪"
+    assert [p.name for p in parse_party_table(text)] == ["أحمد محمود"]
+
+
+def test_record_from_payload_reads_owner_name():
+    assert record_from_payload({"owner_name": " محمد "}).owner_name == "محمد"

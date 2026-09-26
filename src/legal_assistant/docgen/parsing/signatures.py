@@ -31,8 +31,14 @@ class Concept(enum.StrEnum):
 # normalize_for_match, so hamza/ya/teh-marbuta variants are covered.
 _SIGNATURES: dict[Concept, tuple[str, ...]] = {
     Concept.COMPANY_NAME: ("اسم الشركة", "تسمى الشركة", "التسمية"),
-    Concept.HEAD_OFFICE: ("المركز الرئيسي", "مركز الشركة الرئيسي", "المقر الرئيسي"),
-    Concept.CAPITAL: ("رأس مال الشركة", "رأس المال", "راس المال المصدر"),
+    Concept.HEAD_OFFICE: (
+        "المركز الرئيسي",
+        "مركز الشركة الرئيسي",
+        "المقر الرئيسي",
+        "موطنها القانوني",
+        "موطن الشركة",
+    ),
+    Concept.CAPITAL: ("رأس مال الشركة", "رأس المال", "راس المال المصدر", "رأسمال"),
     Concept.PURPOSE: ("غرض الشركة", "أغراض الشركة"),
     Concept.DURATION: ("مدة الشركة", "مدة هذه الشركة"),
 }
@@ -55,6 +61,13 @@ def classify(article: ExtractedArticle) -> Concept | None:
         if any(phrase in body for phrase in phrases):
             return concept
     return None
+
+
+def states(text: str, concept: Concept) -> bool:
+    """Whether `text` says `concept`. The page-map cross-check: warns when the
+    lawyer's article does not look like what they said it is; never overrides."""
+    body = normalize_for_match(text)
+    return any(phrase in body for phrase in _NORMALIZED[concept])
 
 
 def find_article(
