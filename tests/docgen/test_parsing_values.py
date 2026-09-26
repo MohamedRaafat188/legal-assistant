@@ -19,6 +19,16 @@ def test_owner_name_from_the_synthetic_founder_table():
     assert owner_name(text) == "محمد أحمد علي حسن"
 
 
+def test_owner_name_from_a_markdown_pipe_table():
+    text = (
+        "بيانات مؤسس الشركة:\n"
+        "| م | الاسم | الجنسية | إثبات الشخصية |\n"
+        "|---|---|---|---|\n"
+        "| ١ | محمد أحمد علي حسن | مصري | بطاقة رقم ٢٩٠٠١٠١٠١٠١٠١٠ |\n"
+    )
+    assert owner_name(text) == "محمد أحمد علي حسن"
+
+
 def test_owner_name_absent():
     assert owner_name("رأس مال الشركة ١٠٠٠٠٠ جنيه") is None
 

@@ -26,18 +26,27 @@ _NAME_LABEL = re.compile(
 # rather than an «الاسم:» label line, so the name is read by column position
 # instead of a fixed offset -- the column order is not assumed.
 _FOUNDER_TABLE_HEADING = re.compile(r"بيانات\s+مؤسس\s+الشركة\s*[:：]?\s*$", re.MULTILINE)
-_COLUMN_SPLIT = re.compile(r"\s{2,}|\t")
+# OCR may render the table with wide spacing, tabs, or markdown pipes (with a
+# |---| separator row); all three are accepted.
+_COLUMN_SPLIT = re.compile(r"\s*\|\s*|\t|\s{2,}")
+_SEPARATOR_ROW = re.compile(r"^[\s|:\-–—_=]*$")
+
+
+def _cells(line: str) -> list[str]:
+    return [cell.strip() for cell in _COLUMN_SPLIT.split(line.strip().strip("|").strip())]
 
 
 def _founder_table_name(text: str) -> str | None:
     heading = _FOUNDER_TABLE_HEADING.search(text)
     if not heading:
         return None
-    lines = [line.strip() for line in text[heading.end() :].splitlines() if line.strip()]
+    lines = [
+        line for line in text[heading.end() :].splitlines() if not _SEPARATOR_ROW.match(line)
+    ]
     if len(lines) < 2:
         return None
-    header_cells = _COLUMN_SPLIT.split(lines[0])
-    data_cells = _COLUMN_SPLIT.split(lines[1])
+    header_cells = _cells(lines[0])
+    data_cells = _cells(lines[1])
     name_index = next((i for i, cell in enumerate(header_cells) if "الاسم" in cell), None)
     if name_index is None or name_index >= len(data_cells):
         return None
