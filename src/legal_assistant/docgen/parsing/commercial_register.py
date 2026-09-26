@@ -239,8 +239,8 @@ def _parse_share_table(lines: list[str]) -> list[Party] | None:
     name_i = _column(header, "الاسم")
     shares_i = _column(header, "عدد", "الحصص", "الأسهم", "الاسهم")
     pct_i = _column(header, "نسبة", "%", "٪")
-    # «الاسم والجنسية»: the cell reads "<name> / <nationality>".
-    drop_nationality = "الجنسية" in header[name_i]
+    # «الاسم والجنسية» / «الاسم وجنسيته»: the cell reads "<name> / <nationality>".
+    drop_nationality = "جنسي" in header[name_i]
 
     parties: list[Party] = []
     for line in rows[header_at + 1 :]:
@@ -271,9 +271,18 @@ def parse_party_table(text: str) -> list[Party]:
     neither a share row nor a name-shaped line ends it, so trailing prose in
     the same article is never captured as a spurious partner.
     """
+    lines = text.splitlines()
+    # OCR writes tables as markdown pipe rows (see ocr/gemini.py), and the page
+    # map already scopes `text` to the partners article, so a pipe table with
+    # a «الاسم» column needs no lead-in sentence to be trusted.
+    pipe_rows = [line for line in lines if line.strip().startswith("|")]
+    if pipe_rows:
+        table = _parse_share_table(pipe_rows)
+        if table:
+            return table
+
     parties: list[Party] = []
     started = False
-    lines = text.splitlines()
 
     for index, line in enumerate(lines):
         if not started:

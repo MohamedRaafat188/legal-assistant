@@ -232,3 +232,21 @@ def test_the_ocr_prompt_asks_for_the_table_format_this_parser_reads():
     lines = [line.strip() for line in _EXTRACT_PROMPT.splitlines()]
     example = [line for line in lines if line.startswith("|")]
     assert "الاسم" in table_cells(example[0])
+
+
+def test_parse_party_table_reads_a_pipe_table_without_any_lead_in():
+    # The lead-in sentence can wrap or be worded differently; a markdown
+    # table with a «الاسم» header is enough inside the scoped partners article.
+    text = (
+        "حدد رأس مال الشركة بمبلغ ١٠٠٠٠٠ جنيه مصري وقد تم توزيع هذه الحصص بين الشركاء\n"
+        "على الوجه الآتي :\n"
+        "| م | الاسم وجنسيته | عدد الحصص نقدي | نسبة المشاركة |\n"
+        "|---|---|---|---|\n"
+        "| ١ | أحمد محمود سالم / مصر | ٩٠ | ٩٠ |\n"
+        "| ٢ | سارة علي حسن / مصر | ١٠ | ١٠ |\n"
+        "|  | الإجمالي | ١٠٠ | %١٠٠ |\n"
+    )
+    assert parse_party_table(text) == [
+        Party(name="أحمد محمود سالم", shares="٩٠", percentage="٩٠"),
+        Party(name="سارة علي حسن", shares="١٠", percentage="١٠"),
+    ]
