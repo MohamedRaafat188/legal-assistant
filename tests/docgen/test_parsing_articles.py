@@ -1,5 +1,11 @@
+from legal_assistant.docgen.numbering import ArticleRef
 from legal_assistant.docgen.parsing import articles
-from legal_assistant.docgen.parsing.articles import segment_articles
+from legal_assistant.docgen.parsing.articles import (
+    LookupStatus,
+    find_by_ref,
+    preamble_text,
+    segment_articles,
+)
 
 
 def test_segments_the_zmm_excerpt_in_order(zmm_text):
@@ -97,3 +103,51 @@ def test_a_midsentence_cross_reference_does_not_start_a_new_article():
     )
 
     assert [a.number for a in segment_articles(text)] == [1, 2]
+
+
+_SPAN = (
+    "عقد تأسيس شركة ذات مسئولية محدودة\n"
+    "تخضع لأحكام القانون رقم ١٥٩ لسنة ١٩٨١\n"
+    "المادة (٦)\n"
+    "رأس مال الشركة ١٠٠٠٠٠ جنيه.\n"
+    "المادة (٦) مكرر\n"
+    "نص المادة السادسة مكرر.\n"
+    "المادة (٧)\n"
+    "مدة الشركة خمس وعشرون سنة"
+)
+
+
+def test_segment_articles_reads_mukarrar_in_both_heading_positions():
+    arts = segment_articles("المادة (٦) مكرر\nأ\nمادة (٧ مكرر)\nب")
+    assert [(a.number, a.mukarrar) for a in arts] == [(6, True), (7, True)]
+
+
+def test_find_by_ref_never_lets_mukarrar_satisfy_the_base_article():
+    arts = segment_articles(_SPAN)
+    base = find_by_ref(arts, ArticleRef(6))
+    bis = find_by_ref(arts, ArticleRef(6, True))
+    assert base.status is LookupStatus.found and "رأس مال" in base.article.body
+    assert bis.status is LookupStatus.found and "مكرر" in bis.article.body
+
+
+def test_find_by_ref_reports_not_found():
+    assert find_by_ref(segment_articles(_SPAN), ArticleRef(9)).status is LookupStatus.not_found
+
+
+def test_find_by_ref_reports_ambiguous_on_a_repeated_number():
+    text = "مادة (٦)\nالعقد الابتدائي\nالنظام الأساسي\nمادة (٦)\nنص آخر"
+    lookup = find_by_ref(segment_articles(text), ArticleRef(6))
+    assert lookup.status is LookupStatus.ambiguous
+    assert lookup.article is None
+
+
+def test_find_by_ref_flags_the_last_article_in_the_span_as_possibly_truncated():
+    arts = segment_articles(_SPAN)
+    assert find_by_ref(arts, ArticleRef(7)).truncated is True
+    assert find_by_ref(arts, ArticleRef(6)).truncated is False
+
+
+def test_preamble_text_is_everything_before_the_first_heading():
+    assert preamble_text(_SPAN).endswith("لسنة ١٩٨١")
+    assert preamble_text("المادة (١)\nنص") == ""
+    assert preamble_text("بلا عناوين") == "بلا عناوين"

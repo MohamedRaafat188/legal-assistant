@@ -1,10 +1,12 @@
 import pytest
 
 from legal_assistant.docgen.numbering import (
+    ArticleRef,
     article_name,
     articles_title,
     ordinal_words,
     parse_article_number,
+    parse_article_ref,
 )
 
 
@@ -71,3 +73,33 @@ def test_articles_title_empty_raises():
 )
 def test_parse_article_number(heading, expected):
     assert parse_article_number(heading) == expected
+
+
+def test_parse_article_ref_accepts_both_digit_sets():
+    assert parse_article_ref("6") == ArticleRef(6)
+    assert parse_article_ref("٦") == ArticleRef(6)
+
+
+def test_parse_article_ref_keeps_mukarrar_distinct():
+    assert parse_article_ref("٦ مكرر") == ArticleRef(6, mukarrar=True)
+    assert parse_article_ref("6مكرر") == ArticleRef(6, mukarrar=True)
+    assert parse_article_ref("٦ مكرراً") == ArticleRef(6, mukarrar=True)
+    assert ArticleRef(6, mukarrar=True) != ArticleRef(6)
+
+
+def test_parse_article_ref_rejects_junk():
+    for bad in ("", "abc", "6/7", "المادة 6", "0", "1000", "٦ ب"):
+        assert parse_article_ref(bad) is None, bad
+
+
+def test_article_name_appends_mukarrar():
+    assert article_name(6, mukarrar=True) == "المادة السادسة مكرر"
+
+
+def test_articles_title_orders_mukarrar_after_its_base_article():
+    title = articles_title([ArticleRef(7), ArticleRef(6, True), ArticleRef(6)])
+    assert title == "المواد السادسة والسادسة مكرر والسابعة"
+
+
+def test_articles_title_still_accepts_plain_ints():
+    assert articles_title([6, 7]) == "المواد السادسة والسابعة"

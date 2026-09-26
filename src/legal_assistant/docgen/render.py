@@ -15,7 +15,7 @@ from dataclasses import asdict, dataclass
 import docx
 from docxtpl import DocxTemplate
 
-from legal_assistant.docgen.numbering import articles_title
+from legal_assistant.docgen.numbering import ArticleRef, articles_title
 from legal_assistant.docgen.templates.registry import get_template
 
 
@@ -50,7 +50,7 @@ def build_context(
     company_type: str,
     scalars: dict[str, str],
     articles: Sequence[ArticleBlock],
-    article_numbers: Sequence[int],
+    article_numbers: Sequence[ArticleRef | int],
     attendees: Sequence[Attendee],
 ) -> dict:
     """Assemble the docxtpl context.
