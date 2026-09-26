@@ -753,7 +753,9 @@ def merge_fields(
         entry = page_map.entries.get(_FIELD_ENTRY.get(name, ""))
         provenance[name] = {
             "value": value,
-            "source": "cr" if cr_value else ("aoa" if aoa_value else "user"),
+            # None, not "user", when nothing was found: "user" is kept across re-runs
+            # and exempt from the flag warning, so it must mean the lawyer typed it.
+            "source": "cr" if cr_value else ("aoa" if aoa_value else None),
             "span": {"from": entry.first, "to": entry.last} if entry else None,
             "article": _article_label(entry) if entry else None,
             "confidence": 1.0 if value else 0.0,
@@ -1102,13 +1104,15 @@ async def render_session(db: AsyncSession, session: DocgenSession) -> bytes:
     articles = list(session.articles)
     if not articles:
         raise NothingSelectedError("لا توجد مواد معلنة للتعديل؛ أرسل خريطة الصفحات أولا.")
-    label = lambda a: article_name(a.article_number, a.is_mukarrar)  # noqa: E731
+    def labels(rows: Sequence[DocgenArticle]) -> str:
+        return "، ".join(article_name(a.article_number, a.is_mukarrar) for a in rows)
+
     blank = [a for a in articles if not (a.patched_text or "").strip()]
     if blank:
-        raise SessionStateError(f"اكتب نص «قبل التعديل» للمواد: {[label(a) for a in blank]}")
+        raise SessionStateError(f"اكتب نص «قبل التعديل» للمواد: {labels(blank)}")
     missing = [a for a in articles if not (a.new_text or "").strip()]
     if missing:
-        raise SessionStateError(f"اكتب نص «بعد التعديل» للمواد: {[label(a) for a in missing]}")
+        raise SessionStateError(f"اكتب نص «بعد التعديل» للمواد: {labels(missing)}")
 
     row = await db.scalar(select(DocgenFields).where(DocgenFields.session_id == session.id))
     data = row.data or {}
@@ -1135,7 +1139,7 @@ async def render_session(db: AsyncSession, session: DocgenSession) -> bytes:
         scalars=scalars,
         articles=[
             ArticleBlock(
-                article_name=label(a),
+                article_name=article_name(a.article_number, a.is_mukarrar),
                 article_original_content=a.patched_text,
                 article_new_content=a.new_text or "",
             )

@@ -619,6 +619,18 @@ def test_merge_fields_never_overwrites_a_lawyer_correction():
     assert prov["company_name"] == previous["company_name"]
 
 
+def test_merge_fields_refills_a_field_that_was_empty_last_run():
+    # An empty field is not a lawyer correction: a fixed page map must refill it,
+    # and until then it must still count as flagged.
+    empty = AoaExtraction(values={"company_name": None}, flags={"company_name": ["not_found"]})
+    _record, first = service.merge_fields(empty, CompanyRecord(), {}, _page_map())
+    assert first["company_name"]["source"] is None
+    fixed = AoaExtraction(values={"company_name": "انجاز"}, flags={"company_name": []})
+    _record, second = service.merge_fields(fixed, CompanyRecord(), first, _page_map())
+    assert second["company_name"]["value"] == "انجاز"
+    assert second["company_name"]["source"] == "aoa"
+
+
 def test_merge_fields_keeps_the_cr_conflict_rule():
     aoa = AoaExtraction(values={"company_name": "انجاز"}, flags={"company_name": []})
     cr = CompanyRecord(company_name="انجاز للمقاولات")
@@ -665,3 +677,62 @@ def test_claim_for_ocr_statement_requires_a_submitted_page_map():
         service._claim_for_ocr_statement(1).compile(compile_kwargs={"literal_binds": True})
     )
     assert "page_map IS NOT NULL" in sql
+
+
+class _FakeRenderDb:
+    def __init__(self, fields: DocgenFields) -> None:
+        self._fields = fields
+
+    async def scalar(self, *_args, **_kwargs):
+        return self._fields
+
+    async def flush(self):
+        return None
+
+
+def _render_session(articles):
+    scalars = {
+        "commercial_registration_no": "١٢٣٤٥", "commercial_registration_date": "٢٠٢٠/١/١",
+        "company_name": "شركة تجريبية", "company_address": "عنوان تجريبي",
+        "law_number": "١٥٩", "law_year": "١٩٨١", "owner_name": "محمد أحمد علي حسن",
+        "day_date": "٢٠٢٦/٩/٢٦", "day_name": "السبت", "names_of_commissioners": "مفوض تجريبي",
+    }
+    fields = DocgenFields(
+        session_id=1, data={k: {"value": v, "source": "user"} for k, v in scalars.items()}
+    )
+    session = _session(company_type="shakhs_wahed", articles=articles)
+    return session, _FakeRenderDb(fields)
+
+
+def test_render_session_renders_every_declared_article_with_its_mukarrar_heading(monkeypatch):
+    import io
+
+    import docx
+
+    written = {}
+    monkeypatch.setattr(storage, "write", lambda key, data: written.update(doc=data))
+    articles = [
+        DocgenArticle(position=0, article_number=6, is_mukarrar=False, ordinal_words="السادسة",
+                      patched_text="نص قبل ٦", new_text="نص بعد ٦"),
+        DocgenArticle(position=1, article_number=6, is_mukarrar=True, ordinal_words="السادسة",
+                      patched_text="نص قبل ٦ مكرر", new_text="نص بعد ٦ مكرر"),
+    ]
+    session, db = _render_session(articles)
+    asyncio.run(service.render_session(db, session))
+    text = "\n".join(p.text for p in docx.Document(io.BytesIO(written["doc"])).paragraphs)
+    assert "المادة السادسة مكرر" in text
+    assert "نص بعد ٦ مكرر" in text
+    assert session.status == "rendered"
+
+
+def test_render_session_names_every_article_missing_its_new_text():
+    articles = [
+        DocgenArticle(position=0, article_number=6, is_mukarrar=True, ordinal_words="السادسة",
+                      patched_text="قبل", new_text=None),
+        DocgenArticle(position=1, article_number=7, is_mukarrar=False, ordinal_words="السابعة",
+                      patched_text="قبل", new_text=" "),
+    ]
+    session, db = _render_session(articles)
+    with pytest.raises(SessionStateError) as info:
+        asyncio.run(service.render_session(db, session))
+    assert str(info.value).endswith("المادة السادسة مكرر، المادة السابعة")
