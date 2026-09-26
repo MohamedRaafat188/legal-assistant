@@ -7,6 +7,7 @@ from legal_assistant.docgen.parsing.commercial_register import (
     parse_party_table,
     record_from_payload,
     split_capital,
+    table_cells,
 )
 
 PAYLOAD = {
@@ -220,3 +221,14 @@ def test_parse_party_table_reads_a_wide_spaced_share_table():
         ("أحمد محمود سالم", "٦٠"),
         ("سارة علي حسن", "٤٠"),
     ]
+
+
+def test_the_ocr_prompt_asks_for_the_table_format_this_parser_reads():
+    # parse_party_table and the founder-table reader rely on OCR writing
+    # tables as markdown pipe rows; the transcription prompt must ask for it.
+    from legal_assistant.docgen.ocr.gemini import _EXTRACT_PROMPT
+
+    assert "|---|" in _EXTRACT_PROMPT
+    lines = [line.strip() for line in _EXTRACT_PROMPT.splitlines()]
+    example = [line for line in lines if line.startswith("|")]
+    assert "الاسم" in table_cells(example[0])
