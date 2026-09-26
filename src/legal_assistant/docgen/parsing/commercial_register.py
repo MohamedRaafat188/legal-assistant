@@ -199,6 +199,66 @@ _NAME_ONLY = re.compile(r"^\s*(?P<name>[^\d٠-٩:،.؛\n]{3,})\s*$")
 _BLANK_OR_BORDER = re.compile(r"^[\s\-–—_=|.·•]*$")
 
 
+# A bordered share table as OCR renders it: markdown pipes, tabs or wide
+# spacing between cells, with |---| separator rows.
+_CELL_SPLIT = re.compile(r"\s*\|\s*|\t|\s{2,}")
+_TABLE_SEPARATOR = re.compile(r"^[\s|:\-–—_=+]*$")
+_TOTAL_ROW = re.compile(r"الإجمال|الاجمال|المجموع")
+_FIGURE = re.compile(r"[0-9٠-٩][0-9٠-٩,.]*")
+
+
+def table_cells(line: str) -> list[str]:
+    """One table row split into cells, outer pipes dropped."""
+    return [cell.strip() for cell in _CELL_SPLIT.split(line.strip().strip("|").strip())]
+
+
+def _column(header: list[str], *keys: str) -> int | None:
+    return next((i for i, cell in enumerate(header) if any(k in cell for k in keys)), None)
+
+
+def _figure(cells: list[str], index: int | None) -> str | None:
+    if index is None or index >= len(cells):
+        return None
+    match = _FIGURE.search(cells[index])
+    return match.group(0) if match else None
+
+
+def _parse_share_table(lines: list[str]) -> list[Party] | None:
+    """Rows of a column table whose header names a «الاسم» column; None when
+    `lines` is not such a table. Columns are found by their header, never by
+    position. The total row and header continuation rows (no name) are skipped;
+    the first line that is not a table row ends it."""
+    rows = [line for line in lines if not _TABLE_SEPARATOR.match(line)]
+    header_at = next(
+        (i for i, line in enumerate(rows) if "الاسم" in line and len(table_cells(line)) >= 3),
+        None,
+    )
+    if header_at is None:
+        return None
+    header = table_cells(rows[header_at])
+    name_i = _column(header, "الاسم")
+    shares_i = _column(header, "عدد", "الحصص", "الأسهم", "الاسهم")
+    pct_i = _column(header, "نسبة", "%", "٪")
+    # «الاسم والجنسية»: the cell reads "<name> / <nationality>".
+    drop_nationality = "الجنسية" in header[name_i]
+
+    parties: list[Party] = []
+    for line in rows[header_at + 1 :]:
+        cells = table_cells(line)
+        if len(cells) < 3:
+            break
+        name = cells[name_i] if name_i < len(cells) else ""
+        if drop_nationality:
+            name = re.sub(r"\s*/[^/]*$", "", name)
+        name = name.strip()
+        if not re.search(r"[^\W\d_]", name) or _TOTAL_ROW.search(name):
+            continue
+        parties.append(
+            Party(name=name, shares=_figure(cells, shares_i), percentage=_figure(cells, pct_i))
+        )
+    return parties
+
+
 def parse_party_table(text: str) -> list[Party]:
     """Pull partner/shareholder rows out of a capital article's share table.
 
@@ -213,8 +273,9 @@ def parse_party_table(text: str) -> list[Party]:
     """
     parties: list[Party] = []
     started = False
+    lines = text.splitlines()
 
-    for line in text.splitlines():
+    for index, line in enumerate(lines):
         if not started:
             # The roster begins after the "وزعت على الشركاء كالآتى" style lead-in.
             if re.search(
@@ -223,6 +284,9 @@ def parse_party_table(text: str) -> list[Party]:
                 line,
             ):
                 started = True
+                table = _parse_share_table(lines[index + 1 :])
+                if table is not None:
+                    return table
             continue
 
         if _BLANK_OR_BORDER.match(line):

@@ -8,7 +8,10 @@ from __future__ import annotations
 
 import re
 
-from legal_assistant.docgen.parsing.commercial_register import parse_party_table
+from legal_assistant.docgen.parsing.commercial_register import (
+    parse_party_table,
+    table_cells,
+)
 
 # "بالقانون رقم159\n لسنة1981": OCR splits it across lines and drops spaces.
 _LAW = re.compile(r"القانون\s*(?:رقم)?\s*([0-9٠-٩]{1,4})\s*(?:لسنة|لسنه)\s*([0-9٠-٩]{4})")
@@ -26,27 +29,21 @@ _NAME_LABEL = re.compile(
 # rather than an «الاسم:» label line, so the name is read by column position
 # instead of a fixed offset -- the column order is not assumed.
 _FOUNDER_TABLE_HEADING = re.compile(r"بيانات\s+مؤسس\s+الشركة\s*[:：]?\s*$", re.MULTILINE)
-# OCR may render the table with wide spacing, tabs, or markdown pipes (with a
-# |---| separator row); all three are accepted.
-_COLUMN_SPLIT = re.compile(r"\s*\|\s*|\t|\s{2,}")
-_SEPARATOR_ROW = re.compile(r"^[\s|:\-–—_=]*$")
-
-
-def _cells(line: str) -> list[str]:
-    return [cell.strip() for cell in _COLUMN_SPLIT.split(line.strip().strip("|").strip())]
 
 
 def _founder_table_name(text: str) -> str | None:
     heading = _FOUNDER_TABLE_HEADING.search(text)
     if not heading:
         return None
+    # Drop blank lines and |---| separator rows; OCR may render the table with
+    # wide spacing, tabs or markdown pipes (see `table_cells`).
     lines = [
-        line for line in text[heading.end() :].splitlines() if not _SEPARATOR_ROW.match(line)
+        line for line in text[heading.end() :].splitlines() if line.strip(" \t|:-–—_=+")
     ]
     if len(lines) < 2:
         return None
-    header_cells = _cells(lines[0])
-    data_cells = _cells(lines[1])
+    header_cells = table_cells(lines[0])
+    data_cells = table_cells(lines[1])
     name_index = next((i for i, cell in enumerate(header_cells) if "الاسم" in cell), None)
     if name_index is None or name_index >= len(data_cells):
         return None
@@ -82,6 +79,10 @@ def current_value(field_name: str, article_text: str) -> str:
     if field_name == "company_address":
         match = re.search(
             r"(?:الكائن|الكائنة|مقرها)\s*(?:فى|في|ب)?\s*(?P<v>[^.\n]+)", article_text
+        ) or re.search(
+            # «... وموطنها القانوني في العنوان الآتي : <address> .»
+            r"(?:فى|في)\s*العنوان\s*(?:الآت[يى]|الات[يى]|التال[يى])?\s*[:：]?\s*(?P<v>[^.\n]+)",
+            article_text,
         )
         return match.group("v").strip() if match else ""
     if field_name == "company_name":

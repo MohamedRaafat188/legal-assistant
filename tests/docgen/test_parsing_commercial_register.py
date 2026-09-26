@@ -187,3 +187,36 @@ def test_party_table_lead_in_ala_al_wajh_al_ati():
 
 def test_record_from_payload_reads_owner_name():
     assert record_from_payload({"owner_name": " محمد "}).owner_name == "محمد"
+
+
+# Invented names and figures; the layout mirrors the ذ.م.م share table seen in
+# the scans: a two-row header, a «الاسم والجنسية» column and a total row.
+_PIPE_SHARE_TABLE = """وقد تم توزيع هذه الحصص بين الشركاء على الوجه الآتي :
+| م | الاسم والجنسية | عدد الحصص | القيمة ب جنيه مصري | نسبة المشاركة | عملة الوفاء |
+|---|---|---|---|---|---|
+|   |   | نقدي |   |   |   |
+| ١ | أحمد محمود سالم / مصر | ٩٠ | ٩٠٠٠٠ | ٩٠ | جنيه مصري |
+| ٢ | سارة علي حسن / مصر | ١٠ | ١٠٠٠٠ | ١٠ | جنيه مصري |
+|   | الإجمالي | ١٠٠ | ١٠٠٠٠٠ | %١٠٠ |   |
+
+وتبلغ نسبة المشاركة المصرية ١٠٠%"""
+
+
+def test_parse_party_table_reads_a_markdown_share_table_by_header():
+    assert parse_party_table(_PIPE_SHARE_TABLE) == [
+        Party(name="أحمد محمود سالم", shares="٩٠", percentage="٩٠"),
+        Party(name="سارة علي حسن", shares="١٠", percentage="١٠"),
+    ]
+
+
+def test_parse_party_table_reads_a_wide_spaced_share_table():
+    text = (
+        "وزعت الحصص على الشركاء كالآتى:\n"
+        "م  الاسم  عدد الحصص  نسبة المشاركة\n"
+        "١  أحمد محمود سالم  ٦٠  ٦٠\n"
+        "٢  سارة علي حسن  ٤٠  ٤٠\n"
+    )
+    assert [(p.name, p.shares) for p in parse_party_table(text)] == [
+        ("أحمد محمود سالم", "٦٠"),
+        ("سارة علي حسن", "٤٠"),
+    ]

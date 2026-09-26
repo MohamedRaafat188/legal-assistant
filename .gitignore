@@ -28,3 +28,6 @@ arabic_ingest/law159_intermediates/
 
 # docgen uploaded documents (national ID / passport data, purged after 2 days)
 var/
+
+# docgen_validate.py output (rendered from the real sample عقود)
+docgen-validate-*.docx

@@ -35,3 +35,11 @@ def test_owner_name_absent():
 
 def test_current_value_is_the_moved_service_helper():
     assert current_value("capital", "رأس المال ١٠٠٠٠٠ جنيه") == "١٠٠٠٠٠"
+
+
+def test_current_value_reads_an_address_after_al_unwan_al_ati():
+    text = (
+        "يكون المركز الرئيسي لإدارة الشركة وموطنها القانوني في العنوان الآتي : "
+        "١٢ شارع التحرير - الدقي - الجيزة .\nويكون مكان وموقع ممارسة النشاط ..."
+    )
+    assert current_value("company_address", text) == "١٢ شارع التحرير - الدقي - الجيزة"
