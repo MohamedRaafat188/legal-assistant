@@ -13,6 +13,8 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
+from legal_assistant.docgen.arabic import normalize_for_match
+
 
 @dataclass(frozen=True)
 class Party:
@@ -213,7 +215,28 @@ def table_cells(line: str) -> list[str]:
 
 
 def _column(header: list[str], *keys: str) -> int | None:
-    return next((i for i, cell in enumerate(header) if any(k in cell for k in keys)), None)
+    """First header cell containing any key, compared after
+    `normalize_for_match` (hamza forms, ة/ه, ى/ي), since OCR spells headers
+    either way."""
+    wanted = [normalize_for_match(k) for k in keys]
+    return next(
+        (i for i, cell in enumerate(header) if any(k in normalize_for_match(cell) for k in wanted)),
+        None,
+    )
+
+
+# «اسم» as a whole word -- «الاسم», «الإسم», «اسم الشريك» -- but not
+# «القيمة الاسمية» (nominal value), a common مساهمة column. Matched against
+# normalize_for_match output.
+_NAME_HEADER = re.compile(r"(?:^|[\s/])(?:ال)?اسم(?:$|[\s/])")
+
+
+def name_column(header: list[str]) -> int | None:
+    """Index of the name column in a table header row, or None."""
+    return next(
+        (i for i, cell in enumerate(header) if _NAME_HEADER.search(normalize_for_match(cell))),
+        None,
+    )
 
 
 def _figure(cells: list[str], index: int | None) -> str | None:
@@ -230,17 +253,21 @@ def _parse_share_table(lines: list[str]) -> list[Party] | None:
     the first line that is not a table row ends it."""
     rows = [line for line in lines if not _TABLE_SEPARATOR.match(line)]
     header_at = next(
-        (i for i, line in enumerate(rows) if "الاسم" in line and len(table_cells(line)) >= 3),
+        (
+            i
+            for i, line in enumerate(rows)
+            if len(table_cells(line)) >= 3 and name_column(table_cells(line)) is not None
+        ),
         None,
     )
     if header_at is None:
         return None
     header = table_cells(rows[header_at])
-    name_i = _column(header, "الاسم")
-    shares_i = _column(header, "عدد", "الحصص", "الأسهم", "الاسهم")
+    name_i = name_column(header)
+    shares_i = _column(header, "عدد", "الحصص", "الأسهم")
     pct_i = _column(header, "نسبة", "%", "٪")
     # «الاسم والجنسية» / «الاسم وجنسيته»: the cell reads "<name> / <nationality>".
-    drop_nationality = "جنسي" in header[name_i]
+    drop_nationality = "جنسي" in normalize_for_match(header[name_i])
 
     parties: list[Party] = []
     for line in rows[header_at + 1 :]:

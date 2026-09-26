@@ -43,3 +43,17 @@ def test_current_value_reads_an_address_after_al_unwan_al_ati():
         "١٢ شارع التحرير - الدقي - الجيزة .\nويكون مكان وموقع ممارسة النشاط ..."
     )
     assert current_value("company_address", text) == "١٢ شارع التحرير - الدقي - الجيزة"
+
+
+def test_owner_name_accepts_a_hamza_spelled_label():
+    assert owner_name("بيانات مؤسس الشركة:\nالإسم: محمد أحمد علي حسن\n") == "محمد أحمد علي حسن"
+
+
+def test_owner_name_from_a_founder_table_with_a_hamza_header():
+    text = (
+        "بيانات مؤسس الشركة:\n"
+        "| م | الإسم | الجنسية |\n"
+        "|---|---|---|\n"
+        "| ١ | محمد أحمد علي حسن | مصري |\n"
+    )
+    assert owner_name(text) == "محمد أحمد علي حسن"

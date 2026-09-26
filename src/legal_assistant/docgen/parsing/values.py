@@ -9,6 +9,7 @@ from __future__ import annotations
 import re
 
 from legal_assistant.docgen.parsing.commercial_register import (
+    name_column,
     parse_party_table,
     table_cells,
 )
@@ -18,7 +19,7 @@ _LAW = re.compile(r"القانون\s*(?:رقم)?\s*([0-9٠-٩]{1,4})\s*(?:لسن
 
 # «الاسم: ...» / «اسم المؤسس: ...» label lines in a founder table.
 _NAME_LABEL = re.compile(
-    r"^\s*(?:الاسم|اسم المؤسس|اسم مؤسس الشركة|اسم مالك الشركة)\s*[:：/\-]?\s*"
+    r"^\s*(?:ال[اإ]سم|اسم المؤسس|اسم مؤسس الشركة|اسم مالك الشركة)\s*[:：/\-]?\s*"
     r"(?P<name>[^\d٠-٩:\n]{3,}?)\s*$",
     re.MULTILINE,
 )
@@ -44,7 +45,7 @@ def _founder_table_name(text: str) -> str | None:
         return None
     header_cells = table_cells(lines[0])
     data_cells = table_cells(lines[1])
-    name_index = next((i for i, cell in enumerate(header_cells) if "الاسم" in cell), None)
+    name_index = name_column(header_cells)
     if name_index is None or name_index >= len(data_cells):
         return None
     return data_cells[name_index].strip() or None

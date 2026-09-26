@@ -18,7 +18,6 @@ import argparse
 import asyncio
 import json
 import pathlib
-import re
 import sys
 
 from sqlalchemy import select
@@ -27,74 +26,15 @@ from legal_assistant.db.models import User
 from legal_assistant.db.session import get_engine, get_sessionmaker
 from legal_assistant.docgen import service
 from legal_assistant.docgen.models import DocgenSession, SessionStatus
-from legal_assistant.docgen.pages import PageMap
-from legal_assistant.docgen.parsing.commercial_register import parse_party_table
+from legal_assistant.docgen.pages import PageMap, required_entries
+from legal_assistant.docgen.parsing.scoped import ENTRY_FIELDS
 from legal_assistant.docgen.render import document_text
 from legal_assistant.docgen.templates.registry import get_template, verify_all
-
-_ADDRESS_RE = re.compile(
-    r"(?:الكائن|الكائنة|مقرها|العنوان)\s*(?:التالي|الآتي|الأتى)?"
-    r"\s*(?:فى|في|ب)?\s*[:\-]?\s*(?P<v>[^.\n]+)"
-)
 
 
 def _report(label: str, ok: bool, detail: str = "") -> bool:
     print(f"[{'PASS' if ok else 'FAIL'}] {label}{(' -- ' + detail) if detail else ''}")
     return ok
-
-
-def _find_company_address(articles) -> str | None:
-    """Best-effort المركز الرئيسي text, tried against every article's body.
-
-    `service._record_from_articles` only looks at whichever single article
-    `find_article(Concept.HEAD_OFFICE)` returns; if that concept's signature
-    phrase list doesn't match this particular document's wording, the field
-    that production code populates comes back empty. This is the review
-    screen's job in the real product (the lawyer types it in via PATCH
-    /fields when extraction misses it) -- this function plays that same
-    role for the validation script, scanning every article's real OCR'd
-    text with the same regex `service._current_value` uses for this field,
-    rather than fabricating a value.
-    """
-    for article in articles:
-        match = _ADDRESS_RE.search(article.source_text)
-        if match:
-            return match.group("v").strip()
-    return None
-
-
-def _find_attendees(articles) -> list[dict]:
-    """Real attendee rows via `parse_party_table`, tried against every
-    article.
-
-    Both `parsing/` gaps an earlier live run of this script found -- the
-    CAPITAL concept classifier's one-word "رأسمال" spelling and
-    `parse_party_table`'s "على الوجه الآتي" roster lead-in -- are now fixed
-    in `parsing/signatures.py` and `parsing/commercial_register.py`
-    respectively, so production extraction should populate both fields
-    directly. This function stays as the review screen's fallback (the
-    lawyer-correction path this script exercises via PATCH /attendees): a
-    document whose real wording still doesn't match either phrase list
-    degrades to [] here exactly as it would in production, rather than
-    crashing the script. Returns [] when no article's table is recognized;
-    the caller substitutes clearly-labeled placeholder attendees rather than
-    fabricating real ones, since real partner names are never allowed to
-    reach the committed script (see the caller).
-    """
-    for article in articles:
-        parties = parse_party_table(article.source_text)
-        if parties:
-            return [
-                {
-                    "name": p.name,
-                    "shares": p.shares,
-                    "percentage": p.percentage,
-                    "attending": True,
-                    "source": "aoa",
-                }
-                for p in parties
-            ]
-    return []
 
 
 async def run(
@@ -166,9 +106,13 @@ async def run(
                 )
             )
 
-            for article in session.articles[:5]:
-                preview = article.patched_text[:60].replace("\n", " ")
-                print(f"    المادة {article.article_number}: {preview}...")
+            # Lengths only: article text can carry national ID numbers.
+            for article in session.articles:
+                print(
+                    f"    article {article.article_number}"
+                    f"{' mukarrar' if article.is_mukarrar else ''}: "
+                    f"{len(article.patched_text)} chars, status={article.status}"
+                )
 
             results.append(
                 _report(
@@ -190,91 +134,55 @@ async def run(
 
             target = session.articles[0]
 
-            # Fields no aoa_only extraction path can ever populate, or that
-            # this document's wording defeated the concept classifier for
-            # (see _find_company_address) -- supplied here exactly as the
-            # review screen's lawyer-correction flow (PATCH /fields, PATCH
-            # /attendees) is designed to receive them, using values
-            # recovered from this document's own real OCR text wherever
-            # possible rather than fabricated ones.
+            # Extracted fields are REPORTED as extraction left them and never
+            # overwritten here, so this run shows what the pipeline really
+            # produced. A missing one gets a labelled placeholder only so the
+            # render step still runs; its FAIL is already recorded.
             existing = session.fields.data if session.fields else {}
-
-            def _value_of(name: str) -> str:
-                return ((existing.get(name) or {}).get("value")) or ""
-
-            extra_fields: dict[str, str] = {}
-            if not _value_of("law_number"):
-                # aoa_only never extracts this -- it only ever comes from
-                # the السجل التجاري in aoa_plus_cr mode (see
-                # `service._extract_fields`'s CR-only field list). Egypt's
-                # Companies Law 159/1981 is what every one of these company
-                # types' عقد recites; a lawyer using aoa_only types it in
-                # exactly as done here.
-                extra_fields["law_number"] = "159"
-            if not _value_of("law_year"):
-                extra_fields["law_year"] = "1981"
-            if not _value_of("company_address"):
-                found_address = _find_company_address(session.articles)
-                results.append(
-                    _report(
-                        "company_address recovered from OCR text (extraction missed it)",
-                        found_address is not None,
+            placeholders: dict[str, str] = {}
+            for entry_name in required_entries(company_type):
+                for name in ENTRY_FIELDS[entry_name]:
+                    entry = existing.get(name) or {}
+                    ok = bool(entry.get("value"))
+                    results.append(
+                        _report(
+                            f"{name} extracted automatically", ok, f"flags={entry.get('flags')}"
+                        )
                     )
-                )
-                if found_address:
-                    extra_fields["company_address"] = found_address
-                else:
-                    # Same class of miss as `_find_attendees`: neither
-                    # `parsing.signatures`'s HEAD_OFFICE phrase list nor this
-                    # script's own address regex recognized this document's
-                    # actual وموطنها القانوني/العنوان wording. A placeholder
-                    # (never real address text, since none was found) keeps
-                    # the render from blocking on it entirely; the FAIL above
-                    # already records the miss honestly.
-                    extra_fields["company_address"] = "(العنوان لم يُستخرج تلقائياً - يُستكمل يدوياً)"
+                    if not ok:
+                        placeholders[name] = "(لم يُستخرج تلقائياً)"
 
             spec = get_template(company_type)
             if spec.attendee_label:
-                issued_capital = _value_of("issued_capital")
+                attendees = existing.get("attendees") or []
                 results.append(
                     _report(
-                        "issued_capital extracted automatically",
-                        bool(issued_capital),
-                    )
-                )
-
-                attendees = _find_attendees(session.articles)
-                results.append(
-                    _report(
-                        "attendees recovered from OCR text via parse_party_table",
+                        f"{spec.attendee_label} table extracted automatically",
                         bool(attendees),
+                        f"{len(attendees)} rows",
                     )
                 )
+                issued_capital = (existing.get("issued_capital") or {}).get("value")
                 if not attendees and issued_capital:
-                    # parse_party_table's lead-in regex did not recognize this
-                    # document's real wording (see _find_attendees) -- rather
-                    # than commit a real partner's name to this script's git
-                    # history, substitute clearly-labeled placeholder rows
-                    # whose shares still sum to the real issued capital, so
-                    # the reconciliation gate and the render both exercise
-                    # real numbers with no real personal names anywhere in
-                    # source control.
-                    print(
-                        "    party table not recognized; substituting "
-                        "placeholder attendees for the render (see report)"
+                    # A labelled placeholder row, never a real name, whose
+                    # shares still sum to the real issued capital, so the
+                    # capital check and the render run on real numbers.
+                    print("    placeholder attendee used for the render (see FAIL above)")
+                    await service.update_attendees(
+                        db,
+                        session,
+                        [
+                            {
+                                "name": "الشريك الأول",
+                                "shares": issued_capital,
+                                "percentage": "100",
+                                "attending": True,
+                                "source": "user",
+                            }
+                        ],
                     )
-                    attendees = [
-                        {
-                            "name": "الشريك الأول",
-                            "shares": issued_capital,
-                            "percentage": "100",
-                            "attending": True,
-                            "source": "user",
-                        }
-                    ]
-                if attendees:
-                    await service.update_attendees(db, session, attendees)
 
+            # Only what a lawyer always types: nothing here is in the عقد.
             await service.update_fields(
                 db,
                 session,
@@ -284,14 +192,7 @@ async def run(
                     "day_name": "الأحد",
                     "day_date": "2026/09/06",
                     "names_of_commissioners": "أحمد كامل",
-                    # A generic, fictional name -- NOT a value transcribed
-                    # from either real sample. An earlier draft of this
-                    # script (matching the task brief's own literal text)
-                    # used a name here that turned out to match real name
-                    # components of an actual partner named in both samples'
-                    # party tables (see this task's report); that value is
-                    # deliberately not reproduced or committed here.
-                    "owner_name": "محمود عبد الرحمن",
+                    # Generic, fictional names -- never values from the samples.
                     "chairman_name": "محمود عبد الرحمن",
                     "meeting_time": "الحادية عشرة صباحا",
                     "meeting_end_time": "الواحدة ظهرا",
@@ -300,9 +201,7 @@ async def run(
                     "gafi_representative_name": "ممثل الهيئة",
                     "auditor_name": "مراقب الحسابات",
                     "board_meeting_date": "2026/08/20",
-                    "attendance_percentage": "100",
-                    "approval_percentage": "100",
-                    **extra_fields,
+                    **placeholders,
                 },
             )
 
