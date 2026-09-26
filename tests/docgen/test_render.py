@@ -331,3 +331,26 @@ def test_render_keeps_the_scan_paragraph_as_one_paragraph():
         "حدد رأس مال الشركة بمبلغ ١٠٠٠٠٠ جنيه مصري، وجميعها "
         "حصص نقدية، وقد تم توزيع هذه الحصص بين الشركاء على الوجه الآتي :"
     ) in texts
+
+
+def test_column_widths_follow_content_and_fill_the_width():
+    from legal_assistant.docgen.render import column_widths
+
+    rows = [["م", "الاسم والجنسية", "عدد الحصص"], ["١", "أحمد محمود سالم", "٩٠"]]
+    widths = column_widths(rows, 9000)
+    assert widths[1] > widths[2] > widths[0]
+    assert 9000 - len(widths) <= sum(widths) <= 9000
+
+
+def test_generated_paragraph_properties_keep_schema_order():
+    import io
+
+    import docx
+    from docx.oxml.ns import qn
+
+    order = ["pStyle", "keepNext", "keepLines", "widowControl", "bidi", "spacing", "ind",
+             "contextualSpacing", "jc", "rPr"]
+    document = docx.Document(io.BytesIO(_rendered_shakhs_wahed(_OCR_ARTICLE)))
+    for ppr in document.element.body.iter(qn("w:pPr")):
+        seen = [c.tag.split("}")[1] for c in ppr if c.tag.split("}")[1] in order]
+        assert seen == sorted(seen, key=order.index), seen

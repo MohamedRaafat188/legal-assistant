@@ -160,12 +160,44 @@ def _align_start(element) -> None:
             jc.getparent().remove(jc)
 
 
-def _new_paragraph(anchor, text: str, bold: bool = False):
-    """A paragraph in the anchor paragraph's paragraph and run formatting."""
+# pPr children that must come AFTER w:spacing (schema order).
+_AFTER_SPACING = (
+    "w:ind", "w:contextualSpacing", "w:mirrorIndents", "w:suppressOverlap", "w:jc",
+    "w:textDirection", "w:textAlignment", "w:textboxTightWrap", "w:outlineLvl",
+    "w:divId", "w:cnfStyle", "w:rPr", "w:sectPr", "w:pPrChange",
+)
+
+
+def _set_spacing(ppr, **values: str) -> None:
+    """Set w:spacing attributes, creating the element in its schema slot."""
+    spacing = ppr.find(qn("w:spacing"))
+    if spacing is None:
+        spacing = OxmlElement("w:spacing")
+        successor = next(
+            (child for child in ppr if child.tag in {qn(t) for t in _AFTER_SPACING}), None
+        )
+        if successor is None:
+            ppr.append(spacing)
+        else:
+            successor.addprevious(spacing)
+    for name, value in values.items():
+        spacing.set(qn(f"w:{name}"), value)
+
+
+def _new_paragraph(anchor, text: str, bold: bool = False, in_cell: bool = False):
+    """A paragraph in the anchor paragraph's paragraph and run formatting.
+    In a table cell the anchor's indent and spacing are dropped, so rows stay
+    tight."""
     paragraph = OxmlElement("w:p")
     ppr = anchor.find(qn("w:pPr"))
     if ppr is not None:
-        paragraph.append(copy.deepcopy(ppr))
+        ppr = copy.deepcopy(ppr)
+        if in_cell:
+            for tag in ("w:ind", "w:spacing", "w:keepNext", "w:keepLines"):
+                for element in ppr.findall(qn(tag)):
+                    ppr.remove(element)
+            _set_spacing(ppr, before="0", after="0")
+        paragraph.append(ppr)
     first_run = anchor.find(qn("w:r"))
     rpr = first_run.find(qn("w:rPr")) if first_run is not None else None
     rpr = copy.deepcopy(rpr) if rpr is not None else OxmlElement("w:rPr")
@@ -183,16 +215,22 @@ def _new_paragraph(anchor, text: str, bold: bool = False):
     return paragraph
 
 
-def _new_table(anchor, rows: list[list[str]]):
-    """A bordered, right-to-left, full-width table. The first row is the
-    header: bold, and repeated when the table crosses a page."""
+def column_widths(rows: list[list[str]], total: int) -> list[int]:
+    """Split `total` (twips) across the columns in proportion to their
+    longest cell, with a floor so a «م» column stays readable."""
+    weights = [max(4, *(len(row[i]) for row in rows)) for i in range(len(rows[0]))]
+    return [total * w // sum(weights) for w in weights]
+
+
+def _new_table(anchor, rows: list[list[str]], text_width: int):
+    """A bordered, right-to-left table spanning the text width. The first row
+    is the header: bold, and repeated when the table crosses a page."""
+    widths = column_widths(rows, text_width)
     tbl = OxmlElement("w:tbl")
+    # tblPr children in schema order: bidiVisual, tblW, tblBorders, tblLayout.
     tblpr = OxmlElement("w:tblPr")
-    width = OxmlElement("w:tblW")
-    width.set(qn("w:w"), "5000")
-    width.set(qn("w:type"), "pct")
-    tblpr.append(width)
     tblpr.append(OxmlElement("w:bidiVisual"))  # first column on the right
+    tblpr.append(_width("w:tblW", sum(widths)))
     borders = OxmlElement("w:tblBorders")
     for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
         border = OxmlElement(f"w:{edge}")
@@ -202,10 +240,15 @@ def _new_table(anchor, rows: list[list[str]]):
         border.set(qn("w:color"), "000000")
         borders.append(border)
     tblpr.append(borders)
+    layout = OxmlElement("w:tblLayout")
+    layout.set(qn("w:type"), "fixed")
+    tblpr.append(layout)
     tbl.append(tblpr)
     grid = OxmlElement("w:tblGrid")
-    for _ in rows[0]:
-        grid.append(OxmlElement("w:gridCol"))
+    for column in widths:
+        col = OxmlElement("w:gridCol")
+        col.set(qn("w:w"), str(column))
+        grid.append(col)
     tbl.append(grid)
     for index, cells in enumerate(rows):
         tr = OxmlElement("w:tr")
@@ -213,23 +256,43 @@ def _new_table(anchor, rows: list[list[str]]):
             trpr = OxmlElement("w:trPr")
             trpr.append(OxmlElement("w:tblHeader"))
             tr.append(trpr)
-        for value in cells:
+        for column, value in zip(widths, cells, strict=True):
             tc = OxmlElement("w:tc")
-            tc.append(OxmlElement("w:tcPr"))
-            tc.append(_new_paragraph(anchor, value, bold=index == 0))
+            tcpr = OxmlElement("w:tcPr")
+            tcpr.append(_width("w:tcW", column))
+            tc.append(tcpr)
+            tc.append(_new_paragraph(anchor, value, bold=index == 0, in_cell=True))
             tr.append(tc)
         tbl.append(tr)
     return tbl
 
 
-def _expand_marker(anchor, text: str) -> None:
+def _width(tag: str, twips: int):
+    element = OxmlElement(tag)
+    element.set(qn("w:w"), str(twips))
+    element.set(qn("w:type"), "dxa")
+    return element
+
+
+def _expand_marker(anchor, text: str, text_width: int) -> None:
     """Replace the marker paragraph `anchor` with `text` laid out as
     paragraphs and tables, in the anchor's formatting."""
+    after_table = False
     for block in layout_blocks(text) or [TextBlock("")]:
         if isinstance(block, TableBlock):
-            anchor.addprevious(_new_table(anchor, block.rows))
-        else:
-            anchor.addprevious(_new_paragraph(anchor, block.text))
+            anchor.addprevious(_new_table(anchor, block.rows, text_width))
+            after_table = True
+            continue
+        paragraph = _new_paragraph(anchor, block.text)
+        if after_table:
+            # Breathing room between a table and the text under it (6pt).
+            ppr = paragraph.find(qn("w:pPr"))
+            if ppr is None:
+                ppr = OxmlElement("w:pPr")
+                paragraph.insert(0, ppr)
+            _set_spacing(ppr, before="120")
+            after_table = False
+        anchor.addprevious(paragraph)
     anchor.getparent().remove(anchor)
 
 
@@ -276,10 +339,13 @@ def render_document(company_type: str, context: dict) -> bytes:
 
     document = docx.Document(io.BytesIO(rendered.getvalue()))
     body = document.element.body
+    section = document.sections[-1]
+    # Twips: python-docx lengths are EMU, 635 EMU per twip.
+    text_width = (section.page_width - section.left_margin - section.right_margin) // 635
     for paragraph in list(body.iter(qn("w:p"))):
         text = "".join(t.text or "" for t in paragraph.iter(qn("w:t"))).strip()
         if text in texts:
-            _expand_marker(paragraph, texts.pop(text))
+            _expand_marker(paragraph, texts.pop(text), text_width)
     if texts or token in "".join(t.text or "" for t in body.iter(qn("w:t"))):
         # The template puts article text inside other text: fail closed
         # rather than ship a marker. Content-free message.
