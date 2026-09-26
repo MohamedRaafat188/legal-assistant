@@ -736,3 +736,22 @@ def test_render_session_names_every_article_missing_its_new_text():
     with pytest.raises(SessionStateError) as info:
         asyncio.run(service.render_session(db, session))
     assert str(info.value).endswith("المادة السادسة مكرر، المادة السابعة")
+
+
+def test_reconcile_capital_accepts_shares_worth_more_than_a_pound_via_percentages():
+    # 100 حصص of 1000 each: shares (100) never equal the capital (100000),
+    # but the table's percentages add up to 100.
+    attendees = [
+        {"shares": "٩٠", "percentage": "٩٠"},
+        {"shares": "١٠", "percentage": "١٠"},
+    ]
+    assert _reconcile_capital(attendees, "١٠٠٠٠٠") is None
+
+
+def test_reconcile_capital_still_catches_a_missing_partner_through_percentages():
+    assert _reconcile_capital([{"shares": "٩٠", "percentage": "٩٠"}], "١٠٠٠٠٠") is not None
+
+
+def test_reconcile_capital_needs_every_percentage_to_use_them():
+    attendees = [{"shares": "٩٠", "percentage": "١٠٠"}, {"shares": "١٠", "percentage": None}]
+    assert _reconcile_capital(attendees, "١٠٠٠٠٠") is not None

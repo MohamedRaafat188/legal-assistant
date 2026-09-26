@@ -283,39 +283,48 @@ def _reconcile_capital(attendees: Sequence[dict], issued_capital: str | None) ->
     if capital_value <= 0:
         return "لا يمكن التحقق من اكتمال كشف الحضور: قيمة رأس المال المصدر غير صالحة."
 
-    total = 0.0
-    any_share = False
-    for person in attendees:
-        raw = person.get("shares")
-        if not raw:
-            continue
-        cleaned = (
-            to_ascii_digits(str(raw))
-            .replace(",", "")
-            .replace("%", "")
-            .replace("٪", "")
-            .replace("٬", "")
-            .strip()
-        )
-        try:
-            total += float(cleaned)
-            any_share = True
-        except ValueError:
-            continue
-
-    if not any_share:
+    shares = [_figure_value(p.get("shares")) for p in attendees]
+    shares = [v for v in shares if v is not None]
+    if not shares:
         return "لا يمكن التحقق من اكتمال كشف الحضور: بيانات الحصص غير معروفة."
+    total = sum(shares)
 
-    # 1% slack for rounding noise between two independently-OCR'd figures;
-    # anything wider than that is treated as a real discrepancy.
+    # Two independent ways a complete roster shows itself. Shares summing to
+    # the capital holds when a share is worth one pound (and for a سجل box 9
+    # listing each partner's amount); a ذ.م.م table of 100 حصص of 1000 each
+    # does not, but its «نسبة المشاركة» column must still add up to 100%. A
+    # missing partner breaks both. 1% slack absorbs rounding between two
+    # independently-OCR'd figures.
     tolerance = max(1.0, capital_value * 0.01)
-    if abs(total - capital_value) > tolerance:
-        return (
-            f"مجموع حصص الشركاء المذكورين فى الكشف ({total:g}) لا يتفق مع رأس المال "
-            f"المصدر للشركة ({capital_value:g}). قد يكون كشف الشركاء غير مكتمل أو "
-            "غير دقيق؛ راجعه قبل اعتماد نسبة الحضور."
-        )
-    return None
+    if abs(total - capital_value) <= tolerance:
+        return None
+    percentages = [_figure_value(p.get("percentage")) for p in attendees]
+    if percentages and None not in percentages and abs(sum(percentages) - 100) <= 1:
+        return None
+    return (
+        f"مجموع حصص الشركاء المذكورين فى الكشف ({total:g}) لا يتفق مع رأس المال "
+        f"المصدر للشركة ({capital_value:g}). قد يكون كشف الشركاء غير مكتمل أو "
+        "غير دقيق؛ راجعه قبل اعتماد نسبة الحضور."
+    )
+
+
+def _figure_value(raw: object) -> float | None:
+    """A share count or percentage as a number; None when absent or garbled.
+    Digits in either set; %, ٪ and thousands separators are punctuation."""
+    if raw is None or raw == "":
+        return None
+    cleaned = (
+        to_ascii_digits(str(raw))
+        .replace(",", "")
+        .replace("%", "")
+        .replace("٪", "")
+        .replace("٬", "")
+        .strip()
+    )
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
 
 
 # --- error handling plumbing ----------------------------------------------
