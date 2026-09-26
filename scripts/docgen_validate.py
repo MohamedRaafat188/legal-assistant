@@ -5,15 +5,18 @@ like scripts/phase4_validate.py and friends, and unlike tests/, which are
 offline. Requires a populated .env and `alembic upgrade head`.
 
 Usage:
-    python scripts/docgen_validate.py "عقد تأسيس انجاز.pdf" --company-type zmm
+    python scripts/docgen_validate.py "عقد تأسيس انجاز.pdf" --company-type zmm \
+        --page-map scripts/docgen_page_maps/injaz.json
     python scripts/docgen_validate.py "عقد تأسيس نور للتوزيع.pdf" \
-        --company-type shakhs_wahed --cr-no 303907 --cr-date 2021/03/14
+        --company-type shakhs_wahed --page-map scripts/docgen_page_maps/nour.json \
+        --cr-no 303907 --cr-date 2021/03/14
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import pathlib
 import re
 import sys
@@ -24,7 +27,8 @@ from legal_assistant.db.models import User
 from legal_assistant.db.session import get_engine, get_sessionmaker
 from legal_assistant.docgen import service
 from legal_assistant.docgen.models import DocgenSession, SessionStatus
-from legal_assistant.docgen.parsing.commercial_register import parse_party_table, split_capital
+from legal_assistant.docgen.pages import PageMap
+from legal_assistant.docgen.parsing.commercial_register import parse_party_table
 from legal_assistant.docgen.render import document_text
 from legal_assistant.docgen.templates.registry import get_template, verify_all
 
@@ -59,47 +63,23 @@ def _find_company_address(articles) -> str | None:
     return None
 
 
-def _find_issued_capital(articles) -> str | None:
-    """The real رأس المال المصدر figure, tried against every article's text.
-
-    `parsing.signatures.classify`'s CAPITAL phrase list is `("رأس مال
-    الشركة", "رأس المال", "راس المال المصدر")` -- all requiring a space
-    between رأس and مال. A real عقد's capital-amount article can state it as
-    one word ("حدد رأسمال الشركة بمبلغ ..."), which none of those phrases
-    match, while a LATER, unrelated procedural article (e.g. one about
-    capital increase/decrease votes, which legitimately contains the
-    two-word phrase) wins `find_article`'s first-match-in-document-order
-    search instead and has no figure to find. That is a real, reproducible
-    defect in `parsing/signatures.py` found by this task's live run -- out
-    of scope to fix here (this task authorizes `ocr/gemini.py` prompt fixes
-    only, not parser fixes). This function works around it at the
-    validation-script level only, by trying `split_capital` -- a production,
-    unit-tested pure function -- against every article's real OCR'd text and
-    keeping the first non-empty result, instead of trusting `classify`'s
-    (here, wrong) concept tag to pick the article.
-    """
-    for article in articles:
-        _authorized, issued = split_capital(article.source_text)
-        if issued:
-            return issued
-    return None
-
-
 def _find_attendees(articles) -> list[dict]:
     """Real attendee rows via `parse_party_table`, tried against every
     article.
 
-    Also came back empty against this task's real samples: `parse_party_table`
-    only starts scanning for rows after a line matching `(الشركاء|المساهمين|
-    المؤسسين)\\s*(كالآتى|كالاتى|كالتالى|:)`, and this document's actual lead-in
-    reads "...توزيع هذه الحصص بين الشركاء على الوجه الآتي :" -- "على الوجه
-    الآتي" rather than any of the four recognized lead-in shapes -- so the
-    scan never starts and the real share table is never read. A second real,
-    reproducible `parsing/` defect found by this task's live run, equally out
-    of scope to fix here. Returns [] when no article's table is recognized,
-    same as production; the caller substitutes clearly-labeled placeholder
-    attendees rather than fabricating real ones, since real partner names are
-    never allowed to reach the committed script (see the caller).
+    Both `parsing/` gaps an earlier live run of this script found -- the
+    CAPITAL concept classifier's one-word "رأسمال" spelling and
+    `parse_party_table`'s "على الوجه الآتي" roster lead-in -- are now fixed
+    in `parsing/signatures.py` and `parsing/commercial_register.py`
+    respectively, so production extraction should populate both fields
+    directly. This function stays as the review screen's fallback (the
+    lawyer-correction path this script exercises via PATCH /attendees): a
+    document whose real wording still doesn't match either phrase list
+    degrades to [] here exactly as it would in production, rather than
+    crashing the script. Returns [] when no article's table is recognized;
+    the caller substitutes clearly-labeled placeholder attendees rather than
+    fabricating real ones, since real partner names are never allowed to
+    reach the committed script (see the caller).
     """
     for article in articles:
         parties = parse_party_table(article.source_text)
@@ -117,7 +97,9 @@ def _find_attendees(articles) -> list[dict]:
     return []
 
 
-async def run(path: pathlib.Path, company_type: str, cr_no: str, cr_date: str) -> int:
+async def run(
+    path: pathlib.Path, company_type: str, page_map_path: pathlib.Path, cr_no: str, cr_date: str
+) -> int:
     results: list[bool] = []
 
     verify_all()
@@ -149,6 +131,12 @@ async def run(path: pathlib.Path, company_type: str, cr_no: str, cr_date: str) -
             await service.add_upload(db, session, "aoa", path.name, path.read_bytes())
             await db.commit()
 
+        page_map_raw = json.loads(page_map_path.read_text(encoding="utf-8"))
+        async with sessionmaker() as db:
+            session = await service.get_session(db, session_id, user.id)
+            await service.submit_page_map(db, session, page_map_raw)
+            await db.commit()
+
         print("running OCR (this calls the real provider and costs money)...")
         await service.run_ocr_job(session_id)
 
@@ -166,6 +154,18 @@ async def run(path: pathlib.Path, company_type: str, cr_no: str, cr_date: str) -
                     "articles extracted", len(session.articles) > 0, f"{len(session.articles)}"
                 )
             )
+
+            aoa_upload = next(u for u in session.uploads if u.kind == "aoa")
+            ocr_page_count = len((aoa_upload.ocr_pages or {}).keys())
+            mapped_page_count = len(PageMap.from_json(session.page_map).ocr_pages())
+            results.append(
+                _report(
+                    "OCR'd only the mapped pages",
+                    ocr_page_count == mapped_page_count,
+                    f"{ocr_page_count} OCR'd vs {mapped_page_count} mapped",
+                )
+            )
+
             for article in session.articles[:5]:
                 preview = article.patched_text[:60].replace("\n", " ")
                 print(f"    المادة {article.article_number}: {preview}...")
@@ -174,6 +174,13 @@ async def run(path: pathlib.Path, company_type: str, cr_no: str, cr_date: str) -
                 _report(
                     "no article body is empty",
                     all(a.patched_text.strip() for a in session.articles),
+                )
+            )
+            results.append(
+                _report(
+                    "every declared article was found",
+                    all(a.status == "found" for a in session.articles),
+                    ", ".join(f"{a.article_number}:{a.status}" for a in session.articles),
                 )
             )
 
@@ -185,11 +192,11 @@ async def run(path: pathlib.Path, company_type: str, cr_no: str, cr_date: str) -
 
             # Fields no aoa_only extraction path can ever populate, or that
             # this document's wording defeated the concept classifier for
-            # (see _find_company_address/_find_capital_and_attendees) --
-            # supplied here exactly as the review screen's lawyer-correction
-            # flow (PATCH /fields, PATCH /attendees) is designed to receive
-            # them, using values recovered from this document's own real OCR
-            # text wherever possible rather than fabricated ones.
+            # (see _find_company_address) -- supplied here exactly as the
+            # review screen's lawyer-correction flow (PATCH /fields, PATCH
+            # /attendees) is designed to receive them, using values
+            # recovered from this document's own real OCR text wherever
+            # possible rather than fabricated ones.
             existing = session.fields.data if session.fields else {}
 
             def _value_of(name: str) -> str:
@@ -227,17 +234,14 @@ async def run(path: pathlib.Path, company_type: str, cr_no: str, cr_date: str) -
                     extra_fields["company_address"] = "(العنوان لم يُستخرج تلقائياً - يُستكمل يدوياً)"
 
             spec = get_template(company_type)
-            if spec.attendee_label and not _value_of("issued_capital"):
-                issued = _find_issued_capital(session.articles)
+            if spec.attendee_label:
+                issued_capital = _value_of("issued_capital")
                 results.append(
                     _report(
-                        "issued_capital recovered from OCR text "
-                        "(CAPITAL concept classifier missed the real article)",
-                        issued is not None,
+                        "issued_capital extracted automatically",
+                        bool(issued_capital),
                     )
                 )
-                if issued:
-                    extra_fields["issued_capital"] = issued
 
                 attendees = _find_attendees(session.articles)
                 results.append(
@@ -246,7 +250,7 @@ async def run(path: pathlib.Path, company_type: str, cr_no: str, cr_date: str) -
                         bool(attendees),
                     )
                 )
-                if not attendees and issued:
+                if not attendees and issued_capital:
                     # parse_party_table's lead-in regex did not recognize this
                     # document's real wording (see _find_attendees) -- rather
                     # than commit a real partner's name to this script's git
@@ -262,7 +266,7 @@ async def run(path: pathlib.Path, company_type: str, cr_no: str, cr_date: str) -
                     attendees = [
                         {
                             "name": "الشريك الأول",
-                            "shares": issued,
+                            "shares": issued_capital,
                             "percentage": "100",
                             "attending": True,
                             "source": "user",
@@ -302,9 +306,19 @@ async def run(path: pathlib.Path, company_type: str, cr_no: str, cr_date: str) -
                     **extra_fields,
                 },
             )
-            await service.update_article(
-                db, session, target.article_number, selected=True, new_text="النص الجديد للمادة."
-            )
+
+            fields_row = session.fields.data if session.fields else {}
+            for name, entry in fields_row.items():
+                if isinstance(entry, dict):
+                    print(
+                        f"    field {name}: source={entry.get('source')} "
+                        f"flags={entry.get('flags')}"
+                    )
+
+            for article in session.articles:
+                await service.update_article(
+                    db, session, article.position, new_text="النص الجديد للمادة."
+                )
             await db.commit()
 
         async with sessionmaker() as db:
@@ -337,6 +351,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("pdf", type=pathlib.Path)
     parser.add_argument("--company-type", required=True, choices=["shakhs_wahed", "zmm", "masahma"])
+    parser.add_argument("--page-map", type=pathlib.Path, required=True)
     parser.add_argument("--cr-no", default="303907")
     parser.add_argument("--cr-date", default="2021/03/14")
     args = parser.parse_args()
@@ -344,8 +359,13 @@ def main() -> int:
     if not args.pdf.exists():
         print(f"no such file: {args.pdf}")
         return 1
+    if not args.page_map.exists():
+        print(f"no such file: {args.page_map}")
+        return 1
     try:
-        return asyncio.run(run(args.pdf, args.company_type, args.cr_no, args.cr_date))
+        return asyncio.run(
+            run(args.pdf, args.company_type, args.page_map, args.cr_no, args.cr_date)
+        )
     finally:
         asyncio.run(get_engine().dispose())
 
