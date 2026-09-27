@@ -633,6 +633,34 @@ def test_claim_for_ocr_statement_can_retake_an_abandoned_session():
     assert "updated_at=now()" in compiled
 
 
+class _FakeAddDb:
+    def add(self, obj):
+        self.added = obj
+
+    async def flush(self):
+        pass
+
+
+def test_create_session_refuses_masahma_while_it_is_switched_off(monkeypatch):
+    class _FakeSettings:
+        docgen_masahma_enabled = False
+        docgen_retention_days = 2
+
+    monkeypatch.setattr(service, "get_settings", lambda: _FakeSettings())
+    with pytest.raises(SessionStateError):
+        asyncio.run(service.create_session(_FakeAddDb(), 7, "masahma", "aoa_only"))
+
+
+def test_create_session_allows_masahma_once_switched_on(monkeypatch):
+    class _FakeSettings:
+        docgen_masahma_enabled = True
+        docgen_retention_days = 2
+
+    monkeypatch.setattr(service, "get_settings", lambda: _FakeSettings())
+    session = asyncio.run(service.create_session(_FakeAddDb(), 7, "masahma", "aoa_only"))
+    assert session.company_type == "masahma"
+
+
 def test_validate_source_mode_requires_a_cr_upload_in_aoa_plus_cr_mode():
     with pytest.raises(SessionStateError):
         validate_source_mode("aoa_plus_cr", uploaded_kinds={"aoa"}, typed_cr_no=None)

@@ -97,6 +97,10 @@ class Settings(BaseSettings):
     # `docgen.purge_loop`). The files sit on the web service's volume, so the
     # purge must run where they are mounted.
     docgen_purge_interval_minutes: int = 60
+    # مساهمة is off until it has been validated live against a real filed
+    # عقد (ذ.م.م. and شخص واحد have been). Its template is still verified at
+    # startup either way.
+    docgen_masahma_enabled: bool = False
 
 
 def get_settings() -> Settings:

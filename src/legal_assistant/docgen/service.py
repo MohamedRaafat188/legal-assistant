@@ -73,7 +73,7 @@ from legal_assistant.docgen.render import (
     render_document,
 )
 from legal_assistant.docgen.storage import StorageKeyError
-from legal_assistant.docgen.templates.registry import get_template
+from legal_assistant.docgen.templates.registry import CompanyType, get_template
 
 _log = logging.getLogger(__name__)
 
@@ -421,6 +421,8 @@ async def create_session(
         raise SessionStateError(f"unknown source mode: {source_mode}")
 
     settings = get_settings()
+    if company_type == CompanyType.MASAHMA.value and not settings.docgen_masahma_enabled:
+        raise SessionStateError("إعداد محاضر شركات المساهمة غير متاح حاليا.")
     session = DocgenSession(
         user_id=user_id,
         company_type=company_type,
