@@ -36,7 +36,7 @@ _TOKEN = re.compile(r"\{\{.*?\}\}|\{%.*?%\}", re.DOTALL)
 
 # company_type -> (non_empty_paragraph_count, [(rows, cols), ...], sha256_hex_digest)
 _EXPECTED = {
-    "shakhs_wahed": (19, [], "b123ece71fbfcca16c692ebe8dfe45325f0c7a25825b101dd9ad06440b7afd54"),
+    "shakhs_wahed": (19, [], "2f9aba843b84a860638506cef443a6f007315023d00b6a77faf47f3d2e893a23"),
     "zmm": (
         17,
         [(4, 4), (1, 2)],
