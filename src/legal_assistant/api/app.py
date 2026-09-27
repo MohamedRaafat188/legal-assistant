@@ -8,6 +8,8 @@ non-blocking wrapper; the frontend is explicitly out of scope.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 from contextlib import asynccontextmanager
 
@@ -40,7 +42,14 @@ async def lifespan(app: FastAPI):
     verify_all()
     _log.info("legal-assistant API startup: docgen templates verified")
 
+    from legal_assistant.docgen.purge_loop import purge_forever
+
+    purge_task = asyncio.create_task(purge_forever())
+
     yield
+    purge_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await purge_task
     await engine.dispose()
     observability.shutdown()
     _log.info("legal-assistant API shutdown: DB engine disposed, Langfuse flushed")

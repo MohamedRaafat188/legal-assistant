@@ -73,12 +73,12 @@ class Settings(BaseSettings):
     # `ocr_provider` exists so the provider can be swapped without touching
     # callers, not so a local model can be plugged in.
     ocr_provider: str = "gemini"
-    # "gemini-3-pro" (the original default) 404s -- it was never a real model
-    # id, and Task 13 built/tested this against a fake provider so the typo
-    # went unnoticed until Task 17's live run. "gemini-pro-latest" is Google's
-    # rolling alias for the current flagship pro-tier model, which is what
-    # the original name was clearly reaching for.
-    ocr_model: str = "gemini-pro-latest"
+    # Pinned to the exact model the live validation ran against -- never a
+    # rolling alias such as "gemini-pro-latest", which Google can repoint
+    # without notice, and transcription is sensitive to model behaviour (a
+    # lower thinking level alone corrupted a digit group). Re-run
+    # scripts/docgen_validate.py on both samples before changing this.
+    ocr_model: str = "gemini-3.1-pro-preview"
     # Only the pages in the lawyer's submitted page map are OCR'd at full
     # fidelity; this is the low-DPI rate for the on-demand page-picker thumbnail.
     docgen_thumbnail_dpi: int = 60
@@ -87,6 +87,16 @@ class Settings(BaseSettings):
     # outside the DB under a non-guessable key and are purged on expiry.
     docgen_storage_dir: str = "var/docgen"
     docgen_retention_days: int = 2
+    # OCR runs in-process, so a restart kills a job without a trace. A job is
+    # cut off after `docgen_ocr_timeout_minutes`; a session still marked
+    # running `docgen_ocr_stale_minutes` after its last update is therefore
+    # abandoned, never live, and may be retried. Keep stale > timeout.
+    docgen_ocr_timeout_minutes: int = 10
+    docgen_ocr_stale_minutes: int = 15
+    # How often the web process purges expired sessions (see
+    # `docgen.purge_loop`). The files sit on the web service's volume, so the
+    # purge must run where they are mounted.
+    docgen_purge_interval_minutes: int = 60
 
 
 def get_settings() -> Settings:

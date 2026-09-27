@@ -35,7 +35,7 @@ python scripts/ask.py --username U --password P    # interactive CLI chat client
 # docgen (قرار/محضر التعديل generation)
 python -m pytest tests/docgen            # offline unit tests, no services needed
 python scripts/docgen_validate.py "عقد تأسيس انجاز.pdf" --company-type zmm --page-map scripts/docgen_page_maps/injaz.json
-python scripts/docgen_purge.py           # retention purge (daily cron in prod)
+python scripts/docgen_purge.py           # manual retention purge (prod runs it in-process)
 ```
 
 **Testing note:** `tests/` collects a real offline pytest suite for `docgen` (`tests/docgen/`, no services needed) — everything else in the app still has no isolated unit-test path. All other real validation lives in `scripts/*_validate.py`, which exercise the full live stack rather than mocking; running those requires a populated `.env` and reachable services.
@@ -70,8 +70,12 @@ These are the load-bearing design rules; violating them is how you introduce a h
 - **Templates live in `src/legal_assistant/docgen/templates/files/`**, not at
   the repo root, for the same packaging reason. `registry.verify_all()` runs at
   app startup so a template edit that drops a placeholder fails the deploy.
-- **docgen uploads are purged after 2 days** (`scripts/docgen_purge.py`, daily
-  cron). They carry national ID and passport numbers.
+- **docgen uploads are purged after 2 days** by `docgen/purge_loop.py`, inside
+  the web process: the files live on the web service's Railway volume, which
+  no separate cron service can mount. They carry national ID and passport
+  numbers.
+- **docgen's OCR model is pinned** (`OCR_MODEL`), never a rolling alias.
+  Re-run `scripts/docgen_validate.py` on both samples before changing it.
 
 ## Layout notes
 

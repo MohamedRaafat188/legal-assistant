@@ -575,6 +575,64 @@ def test_run_ocr_job_failure_handler_writes_when_the_session_has_not_expired(mon
     assert failure_db.commits == 1
 
 
+def test_run_ocr_job_cuts_off_a_job_that_overruns_its_timeout(monkeypatch):
+    # The cap is what makes a stale `ocr_running` row provably abandoned.
+    session = _session(id=1, status="ocr_running", expires_at=_days_from_now(1))
+    failure_db = _FakeFailureHandlerDb(session)
+    dbs = iter([_FakeClaimDb(), failure_db])
+    monkeypatch.setattr(service, "get_sessionmaker", lambda: (lambda: next(dbs)))
+
+    class _FakeSettings:
+        docgen_ocr_timeout_minutes = 0.0005  # 30ms
+        docgen_ocr_stale_minutes = 15
+
+    monkeypatch.setattr(service, "get_settings", lambda: _FakeSettings())
+
+    async def slow_run_ocr(session_id):
+        await asyncio.sleep(5)
+
+    monkeypatch.setattr(service, "_run_ocr", slow_run_ocr)
+
+    asyncio.run(run_ocr_job(1))
+
+    assert session.status == "failed"
+    assert session.error == service._OCR_TIMED_OUT
+
+
+def _minutes_ago(n: int) -> datetime.datetime:
+    return datetime.datetime.now(datetime.UTC) - datetime.timedelta(minutes=n)
+
+
+def test_ocr_is_live_only_for_a_recently_updated_running_session():
+    assert service._ocr_is_live(_session(status="ocr_running", updated_at=_minutes_ago(1)))
+    # Past `docgen_ocr_stale_minutes` (15): its job died with its process.
+    assert not service._ocr_is_live(_session(status="ocr_running", updated_at=_minutes_ago(30)))
+    assert not service._ocr_is_live(_session(status="ready", updated_at=_minutes_ago(1)))
+
+
+def test_get_session_reports_an_abandoned_ocr_job_as_failed():
+    session = _session(status="ocr_running", updated_at=_minutes_ago(30))
+    result = asyncio.run(get_session(_FakeDb(session), session_id=1, user_id=7))
+    assert result.status == "failed"
+    assert result.error == service._ABANDONED_OCR
+
+
+def test_get_session_leaves_a_live_ocr_job_running():
+    session = _session(status="ocr_running", updated_at=_minutes_ago(1))
+    result = asyncio.run(get_session(_FakeDb(session), session_id=1, user_id=7))
+    assert result.status == "ocr_running"
+    assert result.error is None
+
+
+def test_claim_for_ocr_statement_can_retake_an_abandoned_session():
+    compiled = str(
+        _claim_for_ocr_statement(1).compile(compile_kwargs={"literal_binds": True})
+    )
+    assert "docgen_sessions.updated_at < now() - make_interval(0, 0, 0, 0, 0, 15)" in compiled
+    # The claim stamps the job's start, which `_ocr_is_live` measures from.
+    assert "updated_at=now()" in compiled
+
+
 def test_validate_source_mode_requires_a_cr_upload_in_aoa_plus_cr_mode():
     with pytest.raises(SessionStateError):
         validate_source_mode("aoa_plus_cr", uploaded_kinds={"aoa"}, typed_cr_no=None)

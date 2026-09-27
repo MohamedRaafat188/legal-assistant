@@ -21,12 +21,13 @@ all carry a partner's national ID or passport number. See `_fail_stage`,
 
 from __future__ import annotations
 
+import asyncio
 import datetime
 import logging
 from collections.abc import Coroutine, Sequence
 from typing import Any, NoReturn, TypeVar
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -472,6 +473,29 @@ def _raise_if_expired(session: DocgenSession) -> None:
         raise SessionNotFoundError(f"docgen session {session.id} not found")
 
 
+_ABANDONED_OCR = "توقفت معالجة الملف قبل اكتمالها. أعد إرسال خريطة الصفحات للمحاولة مرة أخرى."
+_OCR_TIMED_OUT = "استغرقت معالجة الملف وقتا أطول من المسموح به. أعد المحاولة."
+
+
+def _ocr_is_live(session: DocgenSession, *, now: datetime.datetime | None = None) -> bool:
+    """True while an OCR job may genuinely still be running for `session`.
+
+    OCR runs inside the web process, so a restart kills a job and leaves
+    `status == "ocr_running"` behind with nothing left to finish it. Every
+    job is cut off after `docgen_ocr_timeout_minutes` (see `run_ocr_job`),
+    so a session still marked running `docgen_ocr_stale_minutes` after its
+    last update cannot have a live job: it is abandoned, and retrying it can
+    never overlap a running one.
+    """
+    if session.status != SessionStatus.ocr_running.value:
+        return False
+    if session.updated_at is None:
+        return True
+    now = now or datetime.datetime.now(datetime.UTC)
+    stale_after = datetime.timedelta(minutes=get_settings().docgen_ocr_stale_minutes)
+    return session.updated_at > now - stale_after
+
+
 async def _load_session_unowned(db: AsyncSession, session_id: int) -> DocgenSession | None:
     """Load a session by id with no `user_id` check, for internal (job)
     callers that are not acting on behalf of a specific caller.
@@ -531,6 +555,11 @@ async def get_session(db: AsyncSession, session_id: int, user_id: int) -> Docgen
     if session is None or session.user_id != user_id:
         raise SessionNotFoundError(f"docgen session {session_id} not found")
     _raise_if_expired(session)
+    if session.status == SessionStatus.ocr_running.value and not _ocr_is_live(session):
+        # Its job died with the process that ran it; show the lawyer a retry
+        # message instead of a spinner that never ends.
+        session.status = SessionStatus.failed.value
+        session.error = _ABANDONED_OCR
     return session
 
 
@@ -544,7 +573,7 @@ async def add_upload(
     """
     if kind not in {k.value for k in UploadKind}:
         raise SessionStateError(f"unknown upload kind: {kind}")
-    if session.status == SessionStatus.ocr_running.value:
+    if _ocr_is_live(session):
         raise SessionStateError("جارٍ تحليل الملف الحالى، انتظر حتى ينتهى.")
 
     count = _run_stage_sync("قراءة عدد صفحات الملف", pdf.page_count, data)
@@ -578,7 +607,7 @@ async def submit_page_map(db: AsyncSession, session: DocgenSession, raw: dict) -
     Needs the عقد uploaded first (and the سجل too, in aoa_plus_cr): the map is
     validated against the عقد's page count.
     """
-    if session.status == SessionStatus.ocr_running.value:
+    if _ocr_is_live(session):
         raise SessionStateError("جارٍ تحليل الملف الحالى، انتظر حتى ينتهى.")
     uploads = {u.kind: u for u in session.uploads}
     aoa = uploads.get(UploadKind.aoa.value)
@@ -618,15 +647,22 @@ def _claim_for_ocr_statement(session_id: int):
     executed from `run_ocr_job`. Without a submitted page map there are no
     pages to OCR.
     """
+    stale_minutes = get_settings().docgen_ocr_stale_minutes
     return (
         update(DocgenSession)
         .where(
             DocgenSession.id == session_id,
-            DocgenSession.status != SessionStatus.ocr_running.value,
+            or_(
+                DocgenSession.status != SessionStatus.ocr_running.value,
+                # Abandoned by a restart; see `_ocr_is_live`.
+                DocgenSession.updated_at
+                < func.now() - func.make_interval(0, 0, 0, 0, 0, stale_minutes),
+            ),
             DocgenSession.expires_at > func.now(),
             DocgenSession.page_map.is_not(None),
         )
-        .values(status=SessionStatus.ocr_running.value, error=None)
+        # `updated_at` is the job's start time: `_ocr_is_live` measures from it.
+        .values(status=SessionStatus.ocr_running.value, error=None, updated_at=func.now())
     )
 
 
@@ -670,8 +706,11 @@ async def run_ocr_job(session_id: int) -> None:
             return
         await _safe_commit(db)
 
+    timeout = get_settings().docgen_ocr_timeout_minutes * 60
     try:
-        await _run_ocr(session_id)
+        # The cap is what lets `_ocr_is_live` call an old `ocr_running` row
+        # abandoned: no job outlives it.
+        await asyncio.wait_for(_run_ocr(session_id), timeout=timeout)
     except Exception as e:  # noqa: BLE001 -- a background job must never escape
         # Deliberately NOT `_log.exception(e)`/`exc_info=True`: the standard
         # traceback formatter renders the exception's own `str()` (and walks
@@ -684,6 +723,8 @@ async def run_ocr_job(session_id: int) -> None:
         # genuinely unexpected failure and gets a type-only message instead.
         if isinstance(e, OcrError | SessionStateError | _StageError):
             message = str(e)
+        elif isinstance(e, TimeoutError):
+            message = _OCR_TIMED_OUT
         else:
             message = f"حدث خطأ غير متوقع أثناء معالجة الملف ({type(e).__name__})."
         _log.error(

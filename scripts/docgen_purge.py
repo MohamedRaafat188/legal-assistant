@@ -1,8 +1,10 @@
 """Delete expired docgen uploads, OCR text, and article text.
 
 Session rows survive in `expired` form for audit; the documents that carry
-national ID and passport numbers do not. Run on a schedule (Railway cron,
-daily is ample for a 2-day retention window).
+national ID and passport numbers do not. In production the web process runs
+this purge itself on a timer (`docgen/purge_loop.py`) -- the files live on
+its volume, which no separate cron service can mount. This script is for
+manual runs from a shell that sees the same `DOCGEN_STORAGE_DIR`.
 
 Usage: python scripts/docgen_purge.py
 Exit code 0 on success, 1 on failure.
