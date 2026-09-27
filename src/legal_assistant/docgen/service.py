@@ -535,6 +535,26 @@ async def _load_session_unowned(db: AsyncSession, session_id: int) -> DocgenSess
     return await db.get(DocgenSession, session_id)
 
 
+def _list_sessions_statement(user_id: int):
+    """The caller's own unexpired sessions, newest first. Pure, so its WHERE
+    clause can be asserted on without a database."""
+    return (
+        select(DocgenSession)
+        .where(
+            DocgenSession.user_id == user_id,
+            DocgenSession.expires_at > func.now(),
+            DocgenSession.status != SessionStatus.expired.value,
+        )
+        .order_by(DocgenSession.created_at.desc())
+    )
+
+
+async def list_sessions(db: AsyncSession, user_id: int) -> list[DocgenSession]:
+    """So a lawyer can resume an unfinished session from any device. Rows
+    only: no uploads, articles or fields are loaded."""
+    return list((await db.execute(_list_sessions_statement(user_id))).scalars())
+
+
 async def get_session(db: AsyncSession, session_id: int, user_id: int) -> DocgenSession:
     """Load a session the caller owns.
 

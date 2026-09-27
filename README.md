@@ -218,10 +218,11 @@ A second, independent feature bolted onto the same app: a lawyer uploads a scann
 
 **No machine-generated prose.** Every string that ends up in the rendered `.docx` is one of exactly three things: verbatim OCR output, a mechanical span substitution recorded in `patch_ops` (e.g. swapping an old company address for a سجل-sourced one), or text the lawyer typed into the review screen. The LLM's only jobs are transcribing the lawyer's mapped pages character-for-character and extracting typed fields into a JSON schema — it never drafts, paraphrases, or completes legal language. This is why the RAG citation guard (`rag/citation_guard.py`) does not apply here: that guard exists to catch a *generated* claim that isn't backed by retrieved text, and docgen never generates a claim to begin with. The equivalent discipline here is `templates/registry.verify_all()` (placeholder-contract enforcement, checked at app startup) plus `render.render_document`'s fail-closed behavior on a missing scalar or an empty article/attendee loop.
 
-**The eleven routes** (`src/legal_assistant/api/routes/docgen.py`, all under `/docgen`, all ownership-scoped through `service.get_session`):
+**The twelve routes** (`src/legal_assistant/api/routes/docgen.py`, all under `/docgen`, all ownership-scoped through `service.get_session`):
 
 | Endpoint | Purpose |
 |---|---|
+| `GET /docgen/sessions` | the caller's unexpired sessions, newest first (rows only, no document content), so an unfinished session can be resumed from any device |
 | `POST /docgen/sessions` | create a session `{company_type, source_mode}` → `DocgenSessionOut` |
 | `POST /docgen/sessions/{id}/uploads` | multipart upload (`kind`=`aoa`\|`commercial_register`, `file`) → `201` + `DocgenUploadOut`; queues nothing — the lawyer picks pages from thumbnails, then submits the page map |
 | `GET /docgen/sessions/{id}` | full session detail — uploads, articles, extracted fields, warning → `DocgenSessionDetailOut` |

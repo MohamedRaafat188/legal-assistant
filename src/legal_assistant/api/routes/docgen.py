@@ -111,6 +111,14 @@ async def _load(db: AsyncSession, session_id: int, user_id: int) -> DocgenSessio
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
 
 
+@router.get("/sessions", response_model=list[DocgenSessionOut])
+async def list_sessions_route(
+    user_id: int = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db_session),
+) -> list[DocgenSessionOut]:
+    return [_session_out(s) for s in await service.list_sessions(db, user_id)]
+
+
 @router.post("/sessions", response_model=DocgenSessionOut, status_code=status.HTTP_201_CREATED)
 async def create_session_route(
     body: DocgenSessionCreateRequest,

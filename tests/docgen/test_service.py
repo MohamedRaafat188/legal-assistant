@@ -340,6 +340,15 @@ def test_get_session_expired_and_missing_raise_the_same_exception_type():
     assert type(expired_exc.value) is type(missing_exc.value)
 
 
+def test_list_sessions_statement_returns_only_the_callers_unexpired_sessions():
+    compiled = str(
+        service._list_sessions_statement(7).compile(compile_kwargs={"literal_binds": True})
+    )
+    assert "docgen_sessions.user_id = 7" in compiled
+    assert "docgen_sessions.expires_at > now()" in compiled
+    assert "docgen_sessions.status != 'expired'" in compiled
+
+
 def test_claim_for_ocr_statement_only_targets_the_named_session():
     compiled = str(
         _claim_for_ocr_statement(42).compile(compile_kwargs={"literal_binds": True})

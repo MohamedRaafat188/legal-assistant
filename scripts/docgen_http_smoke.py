@@ -142,6 +142,13 @@ async def main() -> int:
         try:
             r = await client.get(base, headers=them)
             check("another user's session is 404", r.status_code == 404, str(r.status_code))
+            r = await client.get("/docgen/sessions", headers=me)
+            check(
+                "list shows my session",
+                r.status_code == 200 and [s["id"] for s in r.json()] == [sid],
+            )
+            r = await client.get("/docgen/sessions", headers=them)
+            check("list hides it from another user", r.json() == [])
 
             r = await client.post(
                 f"{base}/uploads", data={"kind": "aoa"},
