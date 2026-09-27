@@ -94,3 +94,8 @@ class Message(Base):
         Index("ix_messages_conversation_id_created_at", "conversation_id", "created_at"),
         Index("ix_messages_trace_id", "trace_id"),
     )
+
+
+# Registered on `Base.metadata` for Alembic autogenerate. Imported last, and
+# for its side effect only, because docgen.models imports Base from here.
+from legal_assistant.docgen import models as _docgen_models  # noqa: E402,F401

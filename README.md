@@ -179,6 +179,9 @@ Langfuse tracing wraps the system as a best-effort, non-blocking layer — every
 - `Settings.database_url` normalizes `postgres://`/`postgresql://` connection strings to `postgresql+asyncpg://` automatically for compatibility with Railway's managed connection string.
 - All dependencies are pinned to exact versions in `pyproject.toml` for reproducible builds.
 - Secrets live only in `.env` (git-ignored) locally and in Railway's environment variables in production; every secret is rotated before being placed into the production environment, rather than reusing development-time values.
+- **docgen storage:** uploads and rendered documents are files under `DOCGEN_STORAGE_DIR`. Railway's container disk is wiped on every deploy, so production needs a **Railway volume** attached to the web service (e.g. mounted at `/data`) with `DOCGEN_STORAGE_DIR=/data/docgen`. A volume pins the service to one replica, which is fine at this scale; moving to object storage later only touches `docgen/storage.py`.
+- **docgen retention purge:** runs **inside the web process** (`docgen/purge_loop.py`) at startup and every `DOCGEN_PURGE_INTERVAL_MINUTES` (60). It wraps `docgen.service.purge_expired`, which deletes uploads, OCR text, and article text for sessions past their `docgen_retention_days` (2-day) window. It cannot be a separate Railway cron service: a volume mounts on one service only, so a cron job would clear the rows but never reach the files, which carry partners' national ID and passport numbers. `scripts/docgen_purge.py` remains for manual runs.
+- **docgen OCR jobs** run in-process as FastAPI background tasks. A job is cut off after `DOCGEN_OCR_TIMEOUT_MINUTES` (10), so a session still marked `ocr_running` `DOCGEN_OCR_STALE_MINUTES` (15) after the job started can only be one whose process died in a redeploy: it is reported as failed and can be retried, instead of staying locked until it expires.
 
 ### Environment configuration
 
@@ -188,12 +191,53 @@ Key variables (see `.env.example`): `QDRANT_CLOUD_URL` / `QDRANT_CLOUD_API_KEY` 
 
 ## Phase 9 — Validation & testing
 
-No pytest suite exists yet (`tests/` is an empty package) — validation instead runs as standalone scripts that exercise the real stack end to end:
+For the RAG chat pipeline, no pytest suite exists (there is no isolated unit-test path for it) — validation instead runs as standalone scripts that exercise the real stack end to end:
 
 - `scripts/phase4_validate.py`, `phase5_validate.py`, `phase6_validate.py` — in-process validation (via `httpx.ASGITransport`) against the real database, Qdrant, embedding service, and Gemini: auth, conversation ownership, streaming citation ordering, cross-session citation reuse, user isolation, guard-fallback safety, and simulated downstream outages.
 - `scripts/railway_smoke_test.py <url>` — post-deploy smoke test against the **live** Railway URL: auth, a cited chat turn over SSE, cross-session memory, isolation, feedback, and polling Langfuse Cloud to confirm trace ingestion.
 - `scripts/check_retrieval.py` — proves the retrieval path (hybrid search → rerank → exact lookup) against Qdrant Cloud with real sample queries.
 - `scripts/check_embedding_consistency.py` — proves the deployed embedding service produces vectors numerically consistent with what's already stored in Qdrant Cloud.
+
+`docgen` (Phase 10, below) is different: `tests/docgen/` is a real, offline `pytest` suite (no services needed — every LLM call is faked), while `scripts/docgen_validate.py` fills the same live-stack role as `phase4_validate.py` and friends. `scripts/docgen_http_smoke.py` drives every docgen route in-process over HTTP against the local database with a fake OCR provider and fictional content (no cost, no real data): status codes, the 422 page-map problem list, thumbnail headers, ownership isolation, render/download, and recovery of an OCR job abandoned by a restart.
+
+---
+
+## Phase 10 — docgen: عقد تأسيس → قرار/محضر تعديل generation
+
+**Location:** `src/legal_assistant/docgen/`, routes in `src/legal_assistant/api/routes/docgen.py`
+
+A second, independent feature bolted onto the same app: a lawyer uploads a scanned Egyptian عقد تأسيس (articles of association), the system OCRs and segments it into numbered مواد, the lawyer picks which article(s) to amend and types the "بعد التعديل" text, and the system renders an editable Word document — a قرار تعديل (شركة شخص واحد) or a محضر جمعية عامة غير عادية (ذ.م.م. or مساهمة) — ready for GAFI filing.
+
+**Source modes.** A session declares one of two:
+- `aoa_only` — only the عقد تأسيس is uploaded; the lawyer types the commercial-registration number/date directly, since there is no سجل تجاري to extract them from. Valid whenever the عقد has never been amended, so its own stated values are still current.
+- `aoa_plus_cr` — the عقد **and** a مستخرج سجل تجاري are both uploaded; fields extracted from the سجل (Box 9 for parties, etc.) take precedence over the عقد's own text where the two disagree, and the disagreement itself is recorded (`conflict`) rather than silently resolved.
+
+**Page map.** There is no automatic page classification: the lawyer gives every placeholder field — and every amended article — a contiguous page span plus an article (a number, or «التمهيد» for the text before the first heading), picked from thumbnails rendered on demand (`docgen_thumbnail_dpi`) and never stored, since a thumbnail carries the same personal data as the upload. `PUT /docgen/sessions/{id}/page-map` validates the map against the عقد's actual page count and every declared entry (422, listing every problem, if it doesn't fit), stores it, and queues OCR for only the pages the map actually references — at full fidelity (`docgen_ocr_dpi`, default 220) — rather than every page of a scanned عقد that commonly runs 20-50+ pages once bank certificates, GAFI stamps, and blank backs are included. Each OCR'd page is cached per upload, so resubmitting a corrected map only pays for pages not already OCR'd.
+
+**Transcription and layout.** The OCR prompt returns each page's body `text` and, separately, its `margins`: running headers and footers, page numbers, form codes, scanner-app logos. Only `text` is used, so page furniture never lands inside an article. Tables come back as markdown pipe tables; the partners/owner table is parsed from them by header (name, shares, percentage, nationality columns found by spelling-tolerant header matching, never by position), and the rendered document turns them into real right-to-left Word tables sized to their content. Scan line wraps are joined into paragraphs, and every paragraph is start-aligned (right, for Arabic) rather than justified. The OCR model is pinned (`OCR_MODEL=gemini-3.1-pro-preview`) — never a rolling alias — because transcription is sensitive to model behaviour: re-run the live validation on both samples before changing it.
+
+**No machine-generated prose.** Every string that ends up in the rendered `.docx` is one of exactly three things: verbatim OCR output, a mechanical span substitution recorded in `patch_ops` (e.g. swapping an old company address for a سجل-sourced one), or text the lawyer typed into the review screen. The LLM's only jobs are transcribing the lawyer's mapped pages character-for-character and extracting typed fields into a JSON schema — it never drafts, paraphrases, or completes legal language. This is why the RAG citation guard (`rag/citation_guard.py`) does not apply here: that guard exists to catch a *generated* claim that isn't backed by retrieved text, and docgen never generates a claim to begin with. The equivalent discipline here is `templates/registry.verify_all()` (placeholder-contract enforcement, checked at app startup) plus `render.render_document`'s fail-closed behavior on a missing scalar or an empty article/attendee loop.
+
+**The twelve routes** (`src/legal_assistant/api/routes/docgen.py`, all under `/docgen`, all ownership-scoped through `service.get_session`):
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /docgen/sessions` | the caller's unexpired sessions, newest first (rows only, no document content), so an unfinished session can be resumed from any device |
+| `POST /docgen/sessions` | create a session `{company_type, source_mode}` → `DocgenSessionOut` |
+| `POST /docgen/sessions/{id}/uploads` | multipart upload (`kind`=`aoa`\|`commercial_register`, `file`) → `201` + `DocgenUploadOut`; queues nothing — the lawyer picks pages from thumbnails, then submits the page map |
+| `GET /docgen/sessions/{id}` | full session detail — uploads, articles, extracted fields, warning → `DocgenSessionDetailOut` |
+| `PUT /docgen/sessions/{id}/page-map` | validate and store the lawyer's page map → `DocgenSessionDetailOut`; queues OCR as a background task |
+| `GET /docgen/sessions/{id}/uploads/{upload_id}/pages/{page}` | one page's thumbnail, rendered now and never stored (`Cache-Control: no-store`) |
+| `PATCH /docgen/sessions/{id}/fields` | lawyer corrections to identity fields (`{fields: {...}}`), marks them user-sourced |
+| `PATCH /docgen/sessions/{id}/articles/{position}` | correct an article's OCR'd "قبل التعديل", or write its "بعد التعديل" — articles are addressed by `position`, not selected |
+| `PATCH /docgen/sessions/{id}/attendees` | replace the attendee/shareholder roster; recomputes the capital reconciliation note |
+| `POST /docgen/sessions/{id}/render` | render the `.docx`; fails closed (`409`) on no declared article, a declared article missing "قبل" or "بعد التعديل" text, or an attendee roster that doesn't reconcile against issued capital |
+| `GET /docgen/sessions/{id}/document` | download the rendered `.docx` |
+| `DELETE /docgen/sessions/{id}` | delete the session row and every file stored for it, immediately |
+
+**Retention.** Uploaded عقود and مستخرجات carry partners' national ID and passport numbers, so they live outside the database under a non-guessable storage key (`docgen_storage_dir`, `var/docgen/` locally) rather than in a DB column, and every session — its uploads, OCR text, and article text — is purged `docgen_retention_days` (2, by default) after creation, by the purge loop running inside the web process (see Phase 8); the session row itself survives in `expired` form for audit, but its content does not.
+
+**Live validation (`scripts/docgen_validate.py`).** Unlike the rest of docgen's test coverage (`tests/docgen/`, fully offline against a faked OCR provider by design — a mocked LLM response only tests the mock), this script hits the real Gemini vision model against real scanned samples end to end, driven by a committed page map (`scripts/docgen_page_maps/`, page and article numbers only — no personal data): upload → page map → OCR the mapped pages only → field extraction → patch → render → a `document_text()` assertion pass. Running it against two real GAFI عقود surfaced defects no synthetic fixture could: an invalid default OCR model id, a Gemini-3-generation response-shape change that broke every OCR call, the CAPITAL concept classifier's phrase list missing a one-word "رأسمال" spelling, and `parse_party_table`'s roster lead-in regex missing an "على الوجه الآتي" phrasing — all fixed in this codebase (see `docgen/ocr/gemini.py`, `config.py`, `parsing/signatures.py`, and `parsing/commercial_register.py`). The script reports whether every page-map field and the partners table were extracted **automatically** (it only types what a lawyer always types: the CR number/date, meeting day and time, names of the commissioners and chairman), and prints lengths and flags only — never document text. Both samples (ذ.م.م. and شخص واحد) pass end to end. The مساهمة path has not yet been validated against a real filed عقد.
 
 ---
 

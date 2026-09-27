@@ -1,0 +1,387 @@
+"""Typed company identity data, from the سجل تجاري or from the عقد.
+
+The سجل is a dense 14-box landscape form under a security guilloche; read as
+free text it comes back scrambled. So the extractor is handed a JSON schema
+with one property per box we need and returns typed fields. This module owns
+the schema and the payload -> dataclass conversion; the LLM call that fills
+the payload lives in `ocr/gemini.py`, so everything here is offline-testable.
+"""
+
+from __future__ import annotations
+
+import re
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+
+from legal_assistant.docgen.arabic import normalize_for_match
+
+
+@dataclass(frozen=True)
+class Party:
+    """A شريك / مساهم and, when the source states it, their holding.
+
+    `shares` and `percentage` are `None` -- never 0, never a guessed split --
+    when the source does not state them. The review screen then asks the
+    lawyer to fill them in.
+    """
+
+    name: str
+    shares: str | None = None
+    percentage: str | None = None
+
+
+@dataclass(frozen=True)
+class CompanyRecord:
+    commercial_registration_no: str | None = None
+    commercial_registration_date: str | None = None
+    company_name: str | None = None
+    law_number: str | None = None
+    law_year: str | None = None
+    company_address: str | None = None
+    owner_name: str | None = None
+    capital: str | None = None
+    # رأس المال المصدر. Equals `capital` for ذ.م.م and شخص واحد, which state a
+    # single figure; differs for مساهمة, whose quorum is computed from المصدر.
+    issued_capital: str | None = None
+    parties: list[Party] = field(default_factory=list)
+
+
+# One property per box we read off the مستخرج. Descriptions are in Arabic
+# because they are read by the extraction model alongside an Arabic page.
+CR_FIELD_SCHEMA: dict = {
+    "type": "object",
+    "properties": {
+        "commercial_registration_no": {
+            "type": "string",
+            "description": "رقم السجل التجارى كما يظهر فى ترويسة المستخرج",
+        },
+        "commercial_registration_date": {
+            "type": "string",
+            "description": "تاريخ القيد من الخانة (1)",
+        },
+        "company_name": {
+            "type": "string",
+            "description": "الاسم التجارى من الخانة (2) بدون وصف الشكل القانونى",
+        },
+        "law_number": {
+            "type": "string",
+            "description": "رقم القانون الذى تخضع له الشركة، من الخانة (2)",
+        },
+        "law_year": {"type": "string", "description": "سنة صدور القانون، من الخانة (2)"},
+        "company_address": {
+            "type": "string",
+            "description": "عنوان المحل الرئيسى من الخانة (6)",
+        },
+        "owner_name": {
+            "type": "string",
+            "description": "اسم صاحب الشركة (لشركات الشخص الواحد) من الخانة (3)",
+        },
+        "capital": {"type": "string", "description": "رأس المال من الخانة (9)"},
+        "issued_capital": {
+            "type": "string",
+            "description": "رأس المال المصدر إن ذُكر منفصلا عن رأس المال المرخص به",
+        },
+        "parties": {
+            "type": "array",
+            "description": (
+                "الشركاء وحصصهم من الخانة (9) إن وُجدت. اتركها فارغة تماما إذا "
+                "لم تذكر الخانة أسماء الشركاء -- لا تخمّن أى توزيع."
+            ),
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "shares": {"type": "string"},
+                    "percentage": {"type": "string"},
+                },
+                "required": ["name"],
+            },
+        },
+    },
+    "required": [],
+}
+
+
+def _clean(value: object) -> str | None:
+    """Trim a payload value; blank and non-string become None."""
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip()
+    return stripped or None
+
+
+def record_from_payload(payload: Mapping) -> CompanyRecord:
+    """Convert a raw extractor payload into a CompanyRecord.
+
+    Missing keys, blanks, and nameless party rows are all tolerated -- the
+    lawyer fills the gaps at review. Anything that is not a mapping is a
+    programming error and raises.
+    """
+    if not isinstance(payload, Mapping):
+        raise TypeError(f"CR payload must be a mapping, got {type(payload).__name__}")
+
+    parties: list[Party] = []
+    for raw in payload.get("parties") or []:
+        if not isinstance(raw, Mapping):
+            continue
+        name = _clean(raw.get("name"))
+        if not name:
+            continue
+        parties.append(
+            Party(
+                name=name,
+                shares=_clean(raw.get("shares")),
+                percentage=_clean(raw.get("percentage")),
+            )
+        )
+
+    return CompanyRecord(
+        commercial_registration_no=_clean(payload.get("commercial_registration_no")),
+        commercial_registration_date=_clean(payload.get("commercial_registration_date")),
+        company_name=_clean(payload.get("company_name")),
+        law_number=_clean(payload.get("law_number")),
+        law_year=_clean(payload.get("law_year")),
+        company_address=_clean(payload.get("company_address")),
+        owner_name=_clean(payload.get("owner_name")),
+        capital=_clean(payload.get("capital")),
+        issued_capital=_clean(payload.get("issued_capital")),
+        parties=parties,
+    )
+
+
+# رأس المال المرخص به X ... رأس المال المصدر Y. Either half may be absent.
+_AUTHORIZED = re.compile(r"(?:المرخص\s*به)[^0-9٠-٩]{0,20}([0-9٠-٩][0-9٠-٩,.]*)")
+_ISSUED = re.compile(r"(?:المصدر)[^0-9٠-٩]{0,20}([0-9٠-٩][0-9٠-٩,.]*)")
+_ANY_FIGURE = re.compile(
+    r"(?:رأس\s*(?:ال)?مال|راس\s*(?:ال)?مال)[^0-9٠-٩]{0,30}([0-9٠-٩][0-9٠-٩,.]*)"
+)
+
+
+def split_capital(text: str) -> tuple[str | None, str | None]:
+    """(authorized, issued) capital figures from a capital article.
+
+    A مساهمة states both and its quorum is computed from المصدر; ذ.م.م and
+    شخص واحد state one figure, which IS the issued capital. Reporting a
+    single figure as `authorized` would silently feed the wrong number into
+    `attendance_percentage`, so a lone figure is always the issued one.
+    """
+    authorized = _AUTHORIZED.search(text)
+    issued = _ISSUED.search(text)
+    if authorized or issued:
+        return (
+            authorized.group(1) if authorized else None,
+            issued.group(1) if issued else None,
+        )
+    single = _ANY_FIGURE.search(text)
+    return (None, single.group(1) if single else None)
+
+
+# A share row is: a name, then optionally a share count, then optionally a
+# percentage -- at least one of the two numbers must be present. Digits in
+# either set; the percentage sign may be ٪ or %. A row missing one half
+# degrades to that field being None (the lawyer fills it in at review); a
+# row with neither number is not a share row at all and falls through to
+# `_NAME_ONLY` instead.
+_SHARE_ROW = re.compile(
+    r"^\s*(?P<name>[^\d٠-٩\n]{3,})?\s*"
+    r"(?:(?P<shares>[0-9٠-٩]+)\s*(?:حصة|حصص|سهم|سهما|أسهم))?\s*"
+    r"(?:(?P<pct>[0-9٠-٩]+(?:[.,][0-9٠-٩]+)?)\s*[٪%])?\s*$"
+)
+
+# Partner names in these documents run 2-5 words; a longer line is prose, not
+# a name, and ends the roster (see `parse_party_table`).
+_MAX_NAME_WORDS = 5
+_NAME_ONLY = re.compile(r"^\s*(?P<name>[^\d٠-٩:،.؛\n]{3,})\s*$")
+
+# Blank lines and table-border artifacts (dashes, pipes, dot leaders) are
+# structural noise, not content -- ragged OCR is full of them between real
+# rows. They carry no name, so they can never become a spurious Party;
+# `parse_party_table` skips them rather than treating them as the end of the
+# roster, so a stray blank line does not silently drop every partner after it.
+_BLANK_OR_BORDER = re.compile(r"^[\s\-–—_=|.·•]*$")
+
+
+# A bordered share table as OCR renders it: markdown pipes, tabs or wide
+# spacing between cells, with |---| separator rows.
+_CELL_SPLIT = re.compile(r"\s*\|\s*|\t|\s{2,}")
+_TABLE_SEPARATOR = re.compile(r"^[\s|:\-–—_=+]*$")
+_TOTAL_ROW = re.compile(r"الإجمال|الاجمال|المجموع")
+_FIGURE = re.compile(r"[0-9٠-٩][0-9٠-٩,.]*")
+
+
+# A markdown separator cell: ---, :---, ---:, :---:.
+_SEPARATOR_CELL = re.compile(r"^:?[-–—_=+]{3,}:?$")
+
+
+def table_cells(line: str) -> list[str]:
+    """One table row split into cells, outer pipes dropped.
+
+    A pipe row splits on pipes ONLY: a double space inside a cell («أحمد
+    محمود») is OCR spacing, not a column. Tabs and wide spacing separate
+    cells only in a table written without pipes."""
+    stripped = line.strip()
+    if stripped.startswith("|"):
+        return [cell.strip() for cell in stripped.strip("|").split("|")]
+    return [cell.strip() for cell in _CELL_SPLIT.split(stripped)]
+
+
+def is_separator_row(line: str) -> bool:
+    """A blank line or a table border, not a row of content. In a pipe table
+    only a real markdown separator (|---|:--:|) counts: «-» and «—» are
+    content there, the usual way to write "none" in a cell."""
+    stripped = line.strip()
+    if stripped.startswith("|"):
+        return all(_SEPARATOR_CELL.match(cell) for cell in table_cells(stripped))
+    return bool(_TABLE_SEPARATOR.match(stripped))
+
+
+def _pipe_blocks(lines: list[str]) -> list[list[str]]:
+    """Each run of consecutive pipe rows: one markdown table per run."""
+    blocks: list[list[str]] = []
+    current: list[str] = []
+    for line in lines:
+        if line.strip().startswith("|"):
+            current.append(line)
+        elif current:
+            blocks.append(current)
+            current = []
+    if current:
+        blocks.append(current)
+    return blocks
+
+
+def _column(header: list[str], *keys: str) -> int | None:
+    """First header cell containing any key, compared after
+    `normalize_for_match` (hamza forms, ة/ه, ى/ي), since OCR spells headers
+    either way."""
+    wanted = [normalize_for_match(k) for k in keys]
+    return next(
+        (i for i, cell in enumerate(header) if any(k in normalize_for_match(cell) for k in wanted)),
+        None,
+    )
+
+
+# «اسم» as a whole word -- «الاسم», «الإسم», «اسم الشريك» -- but not
+# «القيمة الاسمية» (nominal value), a common مساهمة column. Matched against
+# normalize_for_match output.
+_NAME_HEADER = re.compile(r"(?:^|[\s/])(?:ال)?اسم(?:$|[\s/])")
+
+
+def name_column(header: list[str]) -> int | None:
+    """Index of the name column in a table header row, or None."""
+    return next(
+        (i for i, cell in enumerate(header) if _NAME_HEADER.search(normalize_for_match(cell))),
+        None,
+    )
+
+
+def _figure(cells: list[str], index: int | None) -> str | None:
+    if index is None or index >= len(cells):
+        return None
+    match = _FIGURE.search(cells[index])
+    return match.group(0) if match else None
+
+
+def _parse_share_table(lines: list[str]) -> list[Party] | None:
+    """Rows of a column table whose header names a «الاسم» column; None when
+    `lines` is not such a table. Columns are found by their header, never by
+    position. The total row and header continuation rows (no name) are skipped;
+    the first line that is not a table row ends it."""
+    rows = [line for line in lines if not is_separator_row(line)]
+    header_at = next(
+        (
+            i
+            for i, line in enumerate(rows)
+            if len(table_cells(line)) >= 3 and name_column(table_cells(line)) is not None
+        ),
+        None,
+    )
+    if header_at is None:
+        return None
+    header = table_cells(rows[header_at])
+    name_i = name_column(header)
+    shares_i = _column(header, "عدد", "الحصص", "الأسهم")
+    pct_i = _column(header, "نسبة", "%", "٪")
+    # «الاسم والجنسية» / «الاسم وجنسيته»: the cell reads "<name> / <nationality>".
+    drop_nationality = "جنسي" in normalize_for_match(header[name_i])
+
+    parties: list[Party] = []
+    for line in rows[header_at + 1 :]:
+        cells = table_cells(line)
+        if len(cells) < 3:
+            break
+        name = cells[name_i] if name_i < len(cells) else ""
+        if drop_nationality:
+            name = re.sub(r"\s*/[^/]*$", "", name)
+        name = name.strip()
+        if not re.search(r"[^\W\d_]", name) or _TOTAL_ROW.search(name):
+            continue
+        parties.append(
+            Party(name=name, shares=_figure(cells, shares_i), percentage=_figure(cells, pct_i))
+        )
+    return parties
+
+
+def parse_party_table(text: str) -> list[Party]:
+    """Pull partner/shareholder rows out of a capital article's share table.
+
+    Returns [] when the article states only aggregates -- which is exactly
+    what the blank GAFI مساهمة نموذج does. A name with no parseable holding
+    yields a Party with `shares=None`, so the name still prefills and the
+    review screen asks for the number. The roster is a contiguous block of
+    content: blank lines and border artifacts inside it are skipped (see
+    `_BLANK_OR_BORDER`), but the first real-content line once started that is
+    neither a share row nor a name-shaped line ends it, so trailing prose in
+    the same article is never captured as a spurious partner.
+    """
+    lines = text.splitlines()
+    # OCR writes tables as markdown pipe rows (see ocr/gemini.py), and the page
+    # map already scopes `text` to the partners article, so a pipe table with
+    # a «الاسم» column needs no lead-in sentence to be trusted. Each table is
+    # read on its own: a second table in the same article (a bank deposit,
+    # the managers) must never run on into the partners.
+    for block in _pipe_blocks(lines):
+        table = _parse_share_table(block)
+        if table:
+            return table
+
+    parties: list[Party] = []
+    started = False
+
+    for index, line in enumerate(lines):
+        if not started:
+            # The roster begins after the "وزعت على الشركاء كالآتى" style lead-in.
+            if re.search(
+                r"(الشركاء|المساهمين|المؤسسين|مؤسس الشركة)\s*"
+                r"(كالآتى|كالاتى|كالتالى|:|على الوجه الآت[يى]|على الوجه الات[يى])",
+                line,
+            ):
+                started = True
+                table = _parse_share_table(lines[index + 1 :])
+                if table is not None:
+                    return table
+            continue
+
+        if _BLANK_OR_BORDER.match(line):
+            continue
+
+        row = _SHARE_ROW.match(line)
+        if row and row.group("name") and (row.group("shares") or row.group("pct")):
+            parties.append(
+                Party(
+                    name=row.group("name").strip(),
+                    shares=row.group("shares"),
+                    percentage=row.group("pct"),
+                )
+            )
+            continue
+
+        name_only = _NAME_ONLY.match(line)
+        if name_only and len(name_only.group("name").split()) <= _MAX_NAME_WORDS:
+            parties.append(Party(name=name_only.group("name").strip()))
+            continue
+
+        # Neither shape matched -- the roster block has ended.
+        break
+
+    return parties

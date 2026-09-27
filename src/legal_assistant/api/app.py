@@ -8,6 +8,8 @@ non-blocking wrapper; the frontend is explicitly out of scope.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 from contextlib import asynccontextmanager
 
@@ -19,6 +21,7 @@ from legal_assistant import observability
 from legal_assistant.api.routes import auth as auth_routes
 from legal_assistant.api.routes import chat as chat_routes
 from legal_assistant.api.routes import conversations as conversation_routes
+from legal_assistant.api.routes import docgen as docgen_routes
 from legal_assistant.api.routes import feedback as feedback_routes
 from legal_assistant.config import get_settings
 from legal_assistant.db.session import get_engine
@@ -33,7 +36,20 @@ async def lifespan(app: FastAPI):
     async with engine.connect() as conn:
         await conn.execute(text("SELECT 1"))
     _log.info("legal-assistant API startup: DB reachable")
+
+    from legal_assistant.docgen.templates.registry import verify_all
+
+    verify_all()
+    _log.info("legal-assistant API startup: docgen templates verified")
+
+    from legal_assistant.docgen.purge_loop import purge_forever
+
+    purge_task = asyncio.create_task(purge_forever())
+
     yield
+    purge_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await purge_task
     await engine.dispose()
     observability.shutdown()
     _log.info("legal-assistant API shutdown: DB engine disposed, Langfuse flushed")
@@ -55,6 +71,7 @@ def create_app() -> FastAPI:
     app.include_router(conversation_routes.router)
     app.include_router(chat_routes.router)
     app.include_router(feedback_routes.router)
+    app.include_router(docgen_routes.router)
 
     @app.get("/health")
     async def health() -> dict:

@@ -1,0 +1,12 @@
+{
+  "entries": {
+    "company_name": {"from": 1, "to": 1, "article": "2"},
+    "law_reference": {"from": 1, "to": 1, "article": "التمهيد"},
+    "company_address": {"from": 2, "to": 2, "article": "6"},
+    "owner_name": {"from": 2, "to": 2, "article": "4"}
+  },
+  "amended": [
+    {"from": 2, "to": 2, "article": "5"},
+    {"from": 2, "to": 2, "article": "6"}
+  ]
+}

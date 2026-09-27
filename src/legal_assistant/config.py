@@ -4,7 +4,7 @@ New settings for later phases (LLM keys, embedding-service URL, Langfuse
 keys, database URL) should be added here as additional fields.
 """
 
-from pydantic import field_validator
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -68,6 +68,51 @@ class Settings(BaseSettings):
     langfuse_public_key: str | None = None
     langfuse_secret_key: str | None = None
     langfuse_base_url: str = "https://cloud.langfuse.com"
+
+    # docgen (قرار/محضر التعديل generation). OCR is cloud-only by design --
+    # `ocr_provider` exists so the provider can be swapped without touching
+    # callers, not so a local model can be plugged in.
+    ocr_provider: str = "gemini"
+    # Pinned to the exact model the live validation ran against -- never a
+    # rolling alias such as "gemini-pro-latest", which Google can repoint
+    # without notice, and transcription is sensitive to model behaviour (a
+    # lower thinking level alone corrupted a digit group). Re-run
+    # scripts/docgen_validate.py on both samples before changing this.
+    # gemini-3.8-flash was tried on both samples (2026-09-27) and rejected:
+    # it dropped over half the digit groups and missed article headings.
+    ocr_model: str = "gemini-3.1-pro-preview"
+    # Only the pages in the lawyer's submitted page map are OCR'd at full
+    # fidelity; this is the low-DPI rate for the on-demand page-picker thumbnail.
+    docgen_thumbnail_dpi: int = 60
+    docgen_ocr_dpi: int = 220
+    # Uploaded عقود carry national ID and passport numbers, so they live
+    # outside the DB under a non-guessable key and are purged on expiry.
+    docgen_storage_dir: str = "var/docgen"
+    docgen_retention_days: int = 2
+    # OCR runs in-process, so a restart kills a job without a trace. A job is
+    # cut off after `docgen_ocr_timeout_minutes`; a session still marked
+    # running `docgen_ocr_stale_minutes` after its last update is therefore
+    # abandoned, never live, and may be retried. Keep stale > timeout.
+    docgen_ocr_timeout_minutes: int = 10
+    docgen_ocr_stale_minutes: int = 15
+    # How often the web process purges expired sessions (see
+    # `docgen.purge_loop`). The files sit on the web service's volume, so the
+    # purge must run where they are mounted.
+    docgen_purge_interval_minutes: int = 60
+    # مساهمة is off until it has been validated live against a real filed
+    # عقد (ذ.م.م. and شخص واحد have been). Its template is still verified at
+    # startup either way.
+    docgen_masahma_enabled: bool = False
+
+    @model_validator(mode="after")
+    def _stale_outlasts_timeout(self) -> "Settings":
+        # A running job must hit its timeout well before it can be called
+        # abandoned, or a retry could start a second job next to it.
+        if self.docgen_ocr_stale_minutes < self.docgen_ocr_timeout_minutes + 2:
+            raise ValueError(
+                "DOCGEN_OCR_STALE_MINUTES must exceed DOCGEN_OCR_TIMEOUT_MINUTES by at least 2"
+            )
+        return self
 
 
 def get_settings() -> Settings:
