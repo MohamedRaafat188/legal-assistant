@@ -78,6 +78,8 @@ class Settings(BaseSettings):
     # without notice, and transcription is sensitive to model behaviour (a
     # lower thinking level alone corrupted a digit group). Re-run
     # scripts/docgen_validate.py on both samples before changing this.
+    # gemini-3.8-flash was tried on both samples (2026-09-27) and rejected:
+    # it dropped over half the digit groups and missed article headings.
     ocr_model: str = "gemini-3.1-pro-preview"
     # Only the pages in the lawyer's submitted page map are OCR'd at full
     # fidelity; this is the low-DPI rate for the on-demand page-picker thumbnail.
