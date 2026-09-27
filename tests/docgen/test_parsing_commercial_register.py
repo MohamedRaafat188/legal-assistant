@@ -250,3 +250,37 @@ def test_parse_party_table_reads_a_pipe_table_without_any_lead_in():
         Party(name="أحمد محمود سالم", shares="٩٠", percentage="٩٠"),
         Party(name="سارة علي حسن", shares="١٠", percentage="١٠"),
     ]
+
+
+def test_pipe_path_reads_only_the_partners_table_not_a_second_table():
+    # Fictional names and bank.
+    text = (
+        "حدد رأس مال الشركة بمبلغ ١٠٠٠٠٠ جنيه\n"
+        "| م | الاسم | عدد الحصص | النسبة |\n"
+        "|---|---|---|---|\n"
+        "| ١ | شريك تجريبي أول | ٦٠ | ٦٠% |\n"
+        "| ٢ | شريك تجريبي ثان | ٤٠ | ٤٠% |\n"
+        "وقد أودع المبلغ بالبنك التالي:\n"
+        "| م | اسم البنك | الفرع | المبلغ |\n"
+        "|---|---|---|---|\n"
+        "| ١ | بنك تجريبي | القاهرة | ١٠٠٠٠٠ |\n"
+    )
+    assert [p.name for p in parse_party_table(text)] == ["شريك تجريبي أول", "شريك تجريبي ثان"]
+
+
+def test_pipe_cells_split_on_pipes_only():
+    row = "| ١ | أحمد  محمود سالم | ٩٠ | ٩٠% |"
+    assert table_cells(row) == ["١", "أحمد  محمود سالم", "٩٠", "٩٠%"]
+    # Without pipes, wide spacing still separates cells.
+    assert table_cells("١   أحمد سالم   ٩٠") == ["١", "أحمد سالم", "٩٠"]
+
+
+def test_pipe_row_with_a_double_space_keeps_name_and_shares():
+    text = (
+        "| م | الاسم | عدد الحصص | النسبة |\n"
+        "|---|---|---|---|\n"
+        "| ١ | شريك  تجريبي | ٦٠ | ٦٠% |\n"
+        "| ٢ | شريك ثان | ٤٠ | ٤٠% |\n"
+    )
+    first = parse_party_table(text)[0]
+    assert (first.name, first.shares, first.percentage) == ("شريك  تجريبي", "٦٠", "٦٠")

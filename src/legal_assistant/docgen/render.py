@@ -21,7 +21,7 @@ from docx.oxml.ns import qn
 from docxtpl import DocxTemplate
 
 from legal_assistant.docgen.numbering import ArticleRef, articles_title
-from legal_assistant.docgen.parsing.commercial_register import table_cells
+from legal_assistant.docgen.parsing.commercial_register import is_separator_row, table_cells
 from legal_assistant.docgen.templates.registry import get_template
 
 
@@ -101,16 +101,13 @@ def _is_table_line(line: str) -> bool:
     return line.startswith("|")
 
 
-def _is_separator(line: str) -> bool:
-    return set(line) <= set("|-:–— ")
-
-
-def layout_blocks(text: str) -> list[TextBlock | TableBlock]:
+def layout_blocks(text: str, join_wraps: bool = True) -> list[TextBlock | TableBlock]:
     """Paragraphs and tables, in order.
 
-    A paragraph ends at a blank line, a table, a list item, or a line ending
-    in «.», «:» or «؛». Other line breaks are the scan's line wrapping and
-    are joined with a space.
+    With `join_wraps` (OCR text), a paragraph ends at a blank line, a table,
+    a list item, or a line ending in «.», «:» or «؛»; other line breaks are
+    the scan's line wrapping and are joined with a space. Without it (text
+    the lawyer typed), every line break is the lawyer's own and is kept.
     """
     blocks: list[TextBlock | TableBlock] = []
     paragraph: list[str] = []
@@ -131,7 +128,7 @@ def layout_blocks(text: str) -> list[TextBlock | TableBlock]:
         line = raw.strip()
         if _is_table_line(line):
             flush_paragraph()
-            if not _is_separator(line):
+            if not is_separator_row(line):
                 table.append(table_cells(line))
             continue
         flush_table()
@@ -141,7 +138,7 @@ def layout_blocks(text: str) -> list[TextBlock | TableBlock]:
         if _LIST_ITEM.match(line):
             flush_paragraph()
         paragraph.append(line)
-        if line.endswith(_PARAGRAPH_END):
+        if line.endswith(_PARAGRAPH_END) or not join_wraps:
             flush_paragraph()
     flush_table()
     flush_paragraph()
@@ -202,8 +199,15 @@ def _new_paragraph(anchor, text: str, bold: bool = False, in_cell: bool = False)
     rpr = first_run.find(qn("w:rPr")) if first_run is not None else None
     rpr = copy.deepcopy(rpr) if rpr is not None else OxmlElement("w:rPr")
     if bold and rpr.find(qn("w:b")) is None:
-        rpr.insert(0, OxmlElement("w:bCs"))
-        rpr.insert(0, OxmlElement("w:b"))
+        for old in rpr.findall(qn("w:bCs")):
+            rpr.remove(old)
+        # Schema order: rStyle, rFonts, then b, bCs.
+        leading = [e for e in rpr if e.tag in {qn("w:rStyle"), qn("w:rFonts")}]
+        for element in (OxmlElement("w:bCs"), OxmlElement("w:b")):
+            if leading:
+                leading[-1].addnext(element)
+            else:
+                rpr.insert(0, element)
     run = OxmlElement("w:r")
     run.append(rpr)
     t = OxmlElement("w:t")
@@ -274,11 +278,11 @@ def _width(tag: str, twips: int):
     return element
 
 
-def _expand_marker(anchor, text: str, text_width: int) -> None:
+def _expand_marker(anchor, text: str, text_width: int, join_wraps: bool = True) -> None:
     """Replace the marker paragraph `anchor` with `text` laid out as
     paragraphs and tables, in the anchor's formatting."""
     after_table = False
-    for block in layout_blocks(text) or [TextBlock("")]:
+    for block in layout_blocks(text, join_wraps) or [TextBlock("")]:
         if isinstance(block, TableBlock):
             anchor.addprevious(_new_table(anchor, block.rows, text_width))
             after_table = True
@@ -324,12 +328,15 @@ def render_document(company_type: str, context: dict) -> bytes:
     # replaced by real paragraphs and tables (see `layout_blocks`).
     token = secrets.token_hex(8)
     texts: dict[str, str] = {}
+    typed: set[str] = set()  # markers holding lawyer-typed text
     articles = []
     for index, article in enumerate(context.get("articles", [])):
         article = dict(article)
         for key in _LAID_OUT:
             marker = f"DOCGEN-{token}-{index}-{key}"
             texts[marker] = article.get(key) or ""
+            if key == "article_new_content":
+                typed.add(marker)
             article[key] = marker
         articles.append(article)
     template = DocxTemplate(str(spec.path))
@@ -345,7 +352,7 @@ def render_document(company_type: str, context: dict) -> bytes:
     for paragraph in list(body.iter(qn("w:p"))):
         text = "".join(t.text or "" for t in paragraph.iter(qn("w:t"))).strip()
         if text in texts:
-            _expand_marker(paragraph, texts.pop(text), text_width)
+            _expand_marker(paragraph, texts.pop(text), text_width, join_wraps=text not in typed)
     if texts or token in "".join(t.text or "" for t in body.iter(qn("w:t"))):
         # The template puts article text inside other text: fail closed
         # rather than ship a marker. Content-free message.

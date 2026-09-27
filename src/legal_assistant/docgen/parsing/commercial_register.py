@@ -209,9 +209,45 @@ _TOTAL_ROW = re.compile(r"الإجمال|الاجمال|المجموع")
 _FIGURE = re.compile(r"[0-9٠-٩][0-9٠-٩,.]*")
 
 
+# A markdown separator cell: ---, :---, ---:, :---:.
+_SEPARATOR_CELL = re.compile(r"^:?[-–—_=+]{3,}:?$")
+
+
 def table_cells(line: str) -> list[str]:
-    """One table row split into cells, outer pipes dropped."""
-    return [cell.strip() for cell in _CELL_SPLIT.split(line.strip().strip("|").strip())]
+    """One table row split into cells, outer pipes dropped.
+
+    A pipe row splits on pipes ONLY: a double space inside a cell («أحمد
+    محمود») is OCR spacing, not a column. Tabs and wide spacing separate
+    cells only in a table written without pipes."""
+    stripped = line.strip()
+    if stripped.startswith("|"):
+        return [cell.strip() for cell in stripped.strip("|").split("|")]
+    return [cell.strip() for cell in _CELL_SPLIT.split(stripped)]
+
+
+def is_separator_row(line: str) -> bool:
+    """A blank line or a table border, not a row of content. In a pipe table
+    only a real markdown separator (|---|:--:|) counts: «-» and «—» are
+    content there, the usual way to write "none" in a cell."""
+    stripped = line.strip()
+    if stripped.startswith("|"):
+        return all(_SEPARATOR_CELL.match(cell) for cell in table_cells(stripped))
+    return bool(_TABLE_SEPARATOR.match(stripped))
+
+
+def _pipe_blocks(lines: list[str]) -> list[list[str]]:
+    """Each run of consecutive pipe rows: one markdown table per run."""
+    blocks: list[list[str]] = []
+    current: list[str] = []
+    for line in lines:
+        if line.strip().startswith("|"):
+            current.append(line)
+        elif current:
+            blocks.append(current)
+            current = []
+    if current:
+        blocks.append(current)
+    return blocks
 
 
 def _column(header: list[str], *keys: str) -> int | None:
@@ -251,7 +287,7 @@ def _parse_share_table(lines: list[str]) -> list[Party] | None:
     `lines` is not such a table. Columns are found by their header, never by
     position. The total row and header continuation rows (no name) are skipped;
     the first line that is not a table row ends it."""
-    rows = [line for line in lines if not _TABLE_SEPARATOR.match(line)]
+    rows = [line for line in lines if not is_separator_row(line)]
     header_at = next(
         (
             i
@@ -301,10 +337,11 @@ def parse_party_table(text: str) -> list[Party]:
     lines = text.splitlines()
     # OCR writes tables as markdown pipe rows (see ocr/gemini.py), and the page
     # map already scopes `text` to the partners article, so a pipe table with
-    # a «الاسم» column needs no lead-in sentence to be trusted.
-    pipe_rows = [line for line in lines if line.strip().startswith("|")]
-    if pipe_rows:
-        table = _parse_share_table(pipe_rows)
+    # a «الاسم» column needs no lead-in sentence to be trusted. Each table is
+    # read on its own: a second table in the same article (a bank deposit,
+    # the managers) must never run on into the partners.
+    for block in _pipe_blocks(lines):
+        table = _parse_share_table(block)
         if table:
             return table
 

@@ -353,3 +353,43 @@ def test_generated_paragraph_properties_keep_schema_order():
     for ppr in document.element.body.iter(qn("w:pPr")):
         seen = [c.tag.split("}")[1] for c in ppr if c.tag.split("}")[1] in order]
         assert seen == sorted(seen, key=order.index), seen
+
+
+def test_layout_does_not_split_a_pipe_cell_at_a_double_space():
+    text = "| م | الاسم | عدد الحصص |\n|---|---|---|\n| ١ | أحمد  محمود سالم | ٩٠ |"
+    blocks = layout_blocks(text)
+    assert blocks == [TableBlock([["م", "الاسم", "عدد الحصص"], ["١", "أحمد  محمود سالم", "٩٠"]])]
+
+
+def test_layout_keeps_a_row_of_dashes_as_content():
+    blocks = layout_blocks("| البند | القيمة |\n|:---|---:|\n| حصص عينية | - |\n| - | — |")
+    assert blocks == [
+        TableBlock([["البند", "القيمة"], ["حصص عينية", "-"], ["-", "—"]])
+    ]
+
+
+def test_layout_keeps_every_line_break_of_typed_text():
+    typed = "الشريك الأول ٥٠ حصة\nالشريك الثاني ٥٠ حصة"
+    assert layout_blocks(typed, join_wraps=False) == [
+        TextBlock("الشريك الأول ٥٠ حصة"),
+        TextBlock("الشريك الثاني ٥٠ حصة"),
+    ]
+
+
+def test_bold_header_run_keeps_schema_order_after_rfonts():
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+
+    from legal_assistant.docgen.render import _new_paragraph
+
+    anchor = OxmlElement("w:p")
+    run = OxmlElement("w:r")
+    rpr = OxmlElement("w:rPr")
+    for tag in ("w:rStyle", "w:rFonts", "w:sz"):
+        rpr.append(OxmlElement(tag))
+    run.append(rpr)
+    anchor.append(run)
+
+    paragraph = _new_paragraph(anchor, "الاسم", bold=True)
+    tags = [e.tag for e in paragraph.find(qn("w:r")).find(qn("w:rPr"))]
+    assert tags == [qn(t) for t in ("w:rStyle", "w:rFonts", "w:b", "w:bCs", "w:sz")]
