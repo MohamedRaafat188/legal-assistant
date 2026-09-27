@@ -186,7 +186,10 @@ async def put_page_map_route(
         # Claim and commit BEFORE queuing: the job runs in its own DB session
         # and may start before `get_db_session` commits this request's. The
         # claim here also makes this response already read `ocr_running`.
-        claimed = await service.claim_for_ocr(db, session.id)
+        if not await service.claim_for_ocr(db, session.id):
+            # Lost a race with another submission: raising rolls this
+            # request back, so no page map is stored without a job for it.
+            raise service.SessionStateError(service._OCR_BUSY)
         await service._safe_commit(db)
     except service.PageMapError as e:
         # Lawyer-entered page/article numbers and fixed Arabic text only.
@@ -195,8 +198,7 @@ async def put_page_map_route(
         ) from e
     except service.SessionStateError as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
-    if claimed:
-        background.add_task(service.run_claimed_ocr_job, session.id)
+    background.add_task(service.run_claimed_ocr_job, session.id)
     db.expire_all()  # the claim was a Core UPDATE; reload the row
     return _detail_out(await _load(db, session_id, user_id))
 
