@@ -16,7 +16,7 @@ static Arabic message or an exception TYPE NAME ONLY -- never from
 interpolating a caught exception's own message -- because uploads, OCR
 output, and DB error details (a failing statement's bound parameters) can
 all carry a partner's national ID or passport number. See `_fail_stage`,
-`_run_stage_sync`/`_run_stage_async`, and `_safe_flush`/`_safe_commit`.
+`_run_stage_thread`/`_run_stage_async`, and `_safe_flush`/`_safe_commit`.
 """
 
 from __future__ import annotations
@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import datetime
 import logging
+import threading
 from collections.abc import Coroutine, Sequence
 from typing import Any, NoReturn, TypeVar
 
@@ -355,20 +356,36 @@ class _StageError(RuntimeError):
     """One stage of a docgen pipeline (upload, OCR, render, storage) failed.
     Names the stage and the failing exception's type only -- see the module
     note above. Not specific to OCR: `add_upload`, `render_session`, and
-    `delete_session` raise it too, via `_run_stage_sync`."""
+    `delete_session` raise it too, via `_run_stage_thread`."""
 
 
 def _fail_stage(stage: str, error_type: str) -> NoReturn:
     raise _StageError(f"فشلت مرحلة «{stage}» أثناء معالجة الملف تلقائيا ({error_type}).")
 
 
-def _run_stage_sync(stage: str, fn, /, *args: Any, **kwargs: Any) -> Any:
+async def _run_stage_thread(stage: str, fn, /, *args: Any, **kwargs: Any) -> Any:
+    """Run a blocking stage (PDF rasterizing, file I/O) in a worker thread, so
+    the one event loop keeps serving every other request -- /chat streams
+    included -- and `asyncio.wait_for` can bound the job awaiting it."""
     error_type: str | None = None
     try:
-        return fn(*args, **kwargs)
+        return await asyncio.to_thread(fn, *args, **kwargs)
     except _RISKY_ERRORS as e:
         error_type = type(e).__name__
     _fail_stage(stage, error_type)  # only reached on failure; always raises
+
+
+# PyMuPDF must not run in two threads at once: every call into it holds this
+# lock. They still run one at a time, as before, but off the event loop.
+_PDF_LOCK = threading.Lock()
+
+
+def _locked(fn):
+    def call(*args: Any, **kwargs: Any) -> Any:
+        with _PDF_LOCK:
+            return fn(*args, **kwargs)
+
+    return call
 
 
 async def _run_stage_async(stage: str, coro: Coroutine[Any, Any, _T]) -> _T:
@@ -477,6 +494,7 @@ def _raise_if_expired(session: DocgenSession) -> None:
 
 _ABANDONED_OCR = "توقفت معالجة الملف قبل اكتمالها. أعد إرسال خريطة الصفحات للمحاولة مرة أخرى."
 _OCR_TIMED_OUT = "استغرقت معالجة الملف وقتا أطول من المسموح به. أعد المحاولة."
+_OCR_BUSY = "جارٍ تحليل الملف الحالى، انتظر حتى ينتهى."
 
 
 def _ocr_is_live(session: DocgenSession, *, now: datetime.datetime | None = None) -> bool:
@@ -557,12 +575,17 @@ async def get_session(db: AsyncSession, session_id: int, user_id: int) -> Docgen
     if session is None or session.user_id != user_id:
         raise SessionNotFoundError(f"docgen session {session_id} not found")
     _raise_if_expired(session)
-    if session.status == SessionStatus.ocr_running.value and not _ocr_is_live(session):
-        # Its job died with the process that ran it; show the lawyer a retry
-        # message instead of a spinner that never ends.
-        session.status = SessionStatus.failed.value
-        session.error = _ABANDONED_OCR
     return session
+
+
+def displayed_status(session: DocgenSession) -> tuple[str, str | None]:
+    """(status, error) as the lawyer should see them. A job that died with
+    the process that ran it reads as failed with a retry message, instead of
+    a spinner that never ends. Only REPORTED, never written: a write here
+    could land on top of a fresh claim and let a second job start."""
+    if session.status == SessionStatus.ocr_running.value and not _ocr_is_live(session):
+        return SessionStatus.failed.value, _ABANDONED_OCR
+    return session.status, session.error
 
 
 async def add_upload(
@@ -576,18 +599,30 @@ async def add_upload(
     if kind not in {k.value for k in UploadKind}:
         raise SessionStateError(f"unknown upload kind: {kind}")
     if _ocr_is_live(session):
-        raise SessionStateError("جارٍ تحليل الملف الحالى، انتظر حتى ينتهى.")
+        raise SessionStateError(_OCR_BUSY)
 
-    count = _run_stage_sync("قراءة عدد صفحات الملف", pdf.page_count, data)
+    count = await _run_stage_thread("قراءة عدد صفحات الملف", _locked(pdf.page_count), data)
     key = storage.new_key(session.id, kind)
-    _run_stage_sync("حفظ الملف المرفوع", storage.write, key, data)
+    await _run_stage_thread("حفظ الملف المرفوع", storage.write, key, data)
 
     for old in [u for u in session.uploads if u.kind == kind]:
-        _run_stage_sync("حذف الملف السابق", storage.delete, old.storage_key)
+        await _run_stage_thread("حذف الملف السابق", storage.delete, old.storage_key)
         await db.delete(old)
     if kind == UploadKind.aoa.value:
-        # Page numbers in the old map may point elsewhere in the new file.
+        # Page numbers in the old map may point elsewhere in the new file, and
+        # the old file's articles and extracted values must never render as
+        # this one's. Only what the lawyer typed is kept.
         session.page_map = None
+        for article in list(session.articles):
+            await db.delete(article)
+        if session.fields is not None:
+            session.fields.data = {
+                name: entry
+                for name, entry in (session.fields.data or {}).items()
+                if isinstance(entry, dict) and entry.get("source") == "user"
+            }
+        session.status = SessionStatus.draft.value
+        session.error = None
 
     upload = DocgenUpload(
         session_id=session.id, kind=kind, filename=filename, storage_key=key, page_count=count
@@ -610,7 +645,7 @@ async def submit_page_map(db: AsyncSession, session: DocgenSession, raw: dict) -
     validated against the عقد's page count.
     """
     if _ocr_is_live(session):
-        raise SessionStateError("جارٍ تحليل الملف الحالى، انتظر حتى ينتهى.")
+        raise SessionStateError(_OCR_BUSY)
     uploads = {u.kind: u for u in session.uploads}
     aoa = uploads.get(UploadKind.aoa.value)
     if aoa is None:
@@ -627,15 +662,14 @@ async def submit_page_map(db: AsyncSession, session: DocgenSession, raw: dict) -
     return page_map
 
 
-def thumbnail(session: DocgenSession, upload_id: int, page: int) -> bytes:
+async def thumbnail(session: DocgenSession, upload_id: int, page: int) -> bytes:
     """One page of one of this session's uploads as PNG, rendered now."""
     upload = next((u for u in session.uploads if u.id == upload_id), None)
     if upload is None or not 1 <= page <= (upload.page_count or 0):
         raise SessionNotFoundError("page not found")
-    data = _run_stage_sync("قراءة الملف المرفوع", storage.read, upload.storage_key)
-    return _run_stage_sync(
-        "تجهيز صفحة المعاينة", pages.thumbnail, data, page, get_settings().docgen_thumbnail_dpi
-    )
+    data = await _run_stage_thread("قراءة الملف المرفوع", storage.read, upload.storage_key)
+    dpi = get_settings().docgen_thumbnail_dpi
+    return await _run_stage_thread("تجهيز صفحة المعاينة", _locked(pages.thumbnail), data, page, dpi)
 
 
 def _claim_for_ocr_statement(session_id: int):
@@ -696,18 +730,31 @@ async def run_ocr_job(session_id: int) -> None:
     document content, more billed calls) against a session already past its
     retention window, whether or not `purge_expired` has visited it yet.
     """
-    sessionmaker = get_sessionmaker()
-    async with sessionmaker() as db:
-        result = await db.execute(_claim_for_ocr_statement(session_id))
-        if result.rowcount == 0:
-            _log.warning(
-                "docgen OCR job for session %s did not start "
-                "(missing, expired, or already running)",
-                session_id,
-            )
+    async with get_sessionmaker()() as db:
+        if not await claim_for_ocr(db, session_id):
             return
         await _safe_commit(db)
+    await run_claimed_ocr_job(session_id)
 
+
+async def claim_for_ocr(db: AsyncSession, session_id: int) -> bool:
+    """Atomically mark `session_id` as running; False if it cannot start.
+    The caller commits. `PUT /page-map` claims inside the request, so its
+    response already reads `ocr_running`, then queues
+    `run_claimed_ocr_job`."""
+    result = await db.execute(_claim_for_ocr_statement(session_id))
+    if result.rowcount == 0:
+        _log.warning(
+            "docgen OCR job for session %s did not start (missing, expired, or already running)",
+            session_id,
+        )
+        return False
+    return True
+
+
+async def run_claimed_ocr_job(session_id: int) -> None:
+    """The OCR job for a session this caller already claimed."""
+    sessionmaker = get_sessionmaker()
     timeout = get_settings().docgen_ocr_timeout_minutes * 60
     try:
         # The cap is what lets `_ocr_is_live` call an old `ocr_running` row
@@ -890,10 +937,12 @@ async def _run_ocr(session_id: int) -> None:
     cache = {int(k): v for k, v in (aoa.ocr_pages or {}).items()}
     missing = [p for p in page_map.ocr_pages() if p not in cache]
     if missing:
-        aoa_bytes = _run_stage_sync("قراءة عقد التأسيس المرفوع", storage.read, aoa.storage_key)
-        images = _run_stage_sync(
+        aoa_bytes = await _run_stage_thread(
+            "قراءة عقد التأسيس المرفوع", storage.read, aoa.storage_key
+        )
+        images = await _run_stage_thread(
             "تجهيز صفحات العقد للتعرف الضوئى",
-            pdf.render_pages,
+            _locked(pdf.render_pages),
             aoa_bytes,
             dpi=settings.docgen_ocr_dpi,
             pages=missing,
@@ -1004,9 +1053,11 @@ async def _extract_cr(provider, source_mode: str, uploads: dict, settings) -> Co
     cr = uploads.get(UploadKind.commercial_register.value)
     if cr is None:
         return CompanyRecord()
-    cr_bytes = _run_stage_sync("قراءة مستخرج السجل التجارى المرفوع", storage.read, cr.storage_key)
-    images = _run_stage_sync(
-        "تجهيز صفحات مستخرج السجل التجارى", pdf.render_pages, cr_bytes,
+    cr_bytes = await _run_stage_thread(
+        "قراءة مستخرج السجل التجارى المرفوع", storage.read, cr.storage_key
+    )
+    images = await _run_stage_thread(
+        "تجهيز صفحات مستخرج السجل التجارى", _locked(pdf.render_pages), cr_bytes,
         dpi=settings.docgen_ocr_dpi,
     )
     return record_from_payload(await provider.extract_fields(images, CR_FIELD_SCHEMA))
@@ -1063,6 +1114,19 @@ def _build_article_row(
 # --- review edits -----------------------------------------------------------
 
 
+def _refuse_while_ocr_running(session: DocgenSession) -> None:
+    """A running job rewrites fields and articles from a snapshot taken when
+    it started, so an edit made meanwhile would be silently lost."""
+    if _ocr_is_live(session):
+        raise SessionStateError(_OCR_BUSY)
+
+
+async def read_document(session: DocgenSession) -> bytes:
+    """The rendered .docx. A missing file is a content-free `_StageError`
+    (a raw FileNotFoundError names the storage key)."""
+    return await _run_stage_thread("قراءة المستند الناتج", storage.read, session.document_key)
+
+
 def _invalidate_document(session: DocgenSession) -> None:
     """Any edit makes a previously rendered document stale."""
     session.document_key = None
@@ -1072,6 +1136,7 @@ def _invalidate_document(session: DocgenSession) -> None:
 
 async def update_fields(db: AsyncSession, session: DocgenSession, changes: dict) -> None:
     """Apply lawyer corrections to identity fields, marking them user-sourced."""
+    _refuse_while_ocr_running(session)
     row = await db.scalar(select(DocgenFields).where(DocgenFields.session_id == session.id))
     data = dict(row.data or {})
     for name, value in changes.items():
@@ -1096,6 +1161,7 @@ async def update_article(
     `source_text` is never touched, so the verbatim OCR output stays
     auditable next to whatever the lawyer changed.
     """
+    _refuse_while_ocr_running(session)
     article = await db.scalar(
         select(DocgenArticle).where(
             DocgenArticle.session_id == session.id,
@@ -1125,6 +1191,7 @@ async def update_attendees(
     stale "mismatch" or, worse, a stale "reconciles" left over from before
     the edit would defeat the whole point of the check.
     """
+    _refuse_while_ocr_running(session)
     row = await db.scalar(select(DocgenFields).where(DocgenFields.session_id == session.id))
     data = dict(row.data or {})
     data["attendees"] = attendees
@@ -1155,9 +1222,15 @@ async def render_session(db: AsyncSession, session: DocgenSession) -> bytes:
     - any placeholder `render_document` cannot fill -> `MissingContextError`
       (raised by `render_document` itself; not caught or papered over here).
     """
+    _refuse_while_ocr_running(session)
     articles = list(session.articles)
     if not articles:
         raise NothingSelectedError("لا توجد مواد معلنة للتعديل؛ أرسل خريطة الصفحات أولا.")
+    if session.page_map is None or session.status not in (
+        SessionStatus.ready.value,
+        SessionStatus.rendered.value,
+    ):
+        raise SessionStateError("أكمل تحليل الملف بنجاح أولا، ثم أنشئ المستند.")
     def labels(rows: Sequence[DocgenArticle]) -> str:
         return "، ".join(article_name(a.article_number, a.is_mukarrar) for a in rows)
 
@@ -1210,14 +1283,14 @@ async def render_session(db: AsyncSession, session: DocgenSession) -> bytes:
         ],
     )
 
-    document = render_document(session.company_type, context)
+    document = await asyncio.to_thread(render_document, session.company_type, context)
     previous_key = session.document_key
     key = storage.new_key(session.id, "document")
     # Write the NEW object and commit the pointer to it before touching the
     # old one: if deleting the old object then failed partway (e.g. an OSError
     # mid-unlink), the session must still point at a document that exists --
     # never at one it just deleted.
-    _run_stage_sync("حفظ المستند الناتج", storage.write, key, document)
+    await _run_stage_thread("حفظ المستند الناتج", storage.write, key, document)
     session.document_key = key
     session.status = SessionStatus.rendered.value
     await _safe_flush(db)
@@ -1245,7 +1318,7 @@ async def render_session(db: AsyncSession, session: DocgenSession) -> bytes:
 
 async def delete_session(db: AsyncSession, session: DocgenSession) -> None:
     """Delete the session row and every file stored for it, now."""
-    _run_stage_sync("حذف ملفات الجلسة", storage.delete_session, session.id)
+    await _run_stage_thread("حذف ملفات الجلسة", storage.delete_session, session.id)
     await db.delete(session)
     await _safe_flush(db)
 

@@ -4,7 +4,7 @@ New settings for later phases (LLM keys, embedding-service URL, Langfuse
 keys, database URL) should be added here as additional fields.
 """
 
-from pydantic import field_validator
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -101,6 +101,16 @@ class Settings(BaseSettings):
     # عقد (ذ.م.م. and شخص واحد have been). Its template is still verified at
     # startup either way.
     docgen_masahma_enabled: bool = False
+
+    @model_validator(mode="after")
+    def _stale_outlasts_timeout(self) -> "Settings":
+        # A running job must hit its timeout well before it can be called
+        # abandoned, or a retry could start a second job next to it.
+        if self.docgen_ocr_stale_minutes < self.docgen_ocr_timeout_minutes + 2:
+            raise ValueError(
+                "DOCGEN_OCR_STALE_MINUTES must exceed DOCGEN_OCR_TIMEOUT_MINUTES by at least 2"
+            )
+        return self
 
 
 def get_settings() -> Settings:

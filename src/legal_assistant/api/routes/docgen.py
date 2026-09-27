@@ -35,7 +35,7 @@ from legal_assistant.api.schemas import (
     DocgenSessionOut,
     DocgenUploadOut,
 )
-from legal_assistant.docgen import service, storage
+from legal_assistant.docgen import service
 from legal_assistant.docgen.models import DocgenSession
 from legal_assistant.docgen.numbering import article_name
 from legal_assistant.docgen.pdf import InvalidPdfError
@@ -51,12 +51,13 @@ _MAX_UPLOAD_BYTES = 30 * 1024 * 1024
 
 
 def _session_out(session: DocgenSession) -> DocgenSessionOut:
+    shown_status, shown_error = service.displayed_status(session)
     return DocgenSessionOut(
         id=session.id,
         company_type=session.company_type,
         source_mode=session.source_mode,
-        status=session.status,
-        error=session.error,
+        status=shown_status,
+        error=shown_error,
         has_document=session.document_key is not None,
         created_at=session.created_at,
         updated_at=session.updated_at,
@@ -99,7 +100,7 @@ def _detail_out(session: DocgenSession) -> DocgenSessionDetailOut:
         ],
         articles=[_article_out(a) for a in session.articles],
         fields=(session.fields.data if session.fields else {}),
-        warning=session.error,
+        warning=service.displayed_status(session)[1],
     )
 
 
@@ -145,7 +146,7 @@ async def upload_route(
     try:
         upload = await service.add_upload(db, session, kind, file.filename or "upload.pdf", data)
     except (InvalidPdfError, service.SessionStateError, service._StageError) as e:
-        # `add_upload` runs `pdf.page_count` through `service._run_stage_sync`,
+        # `add_upload` runs `pdf.page_count` through `service._run_stage_thread`,
         # which wraps a malformed-PDF `InvalidPdfError` into `_StageError`
         # before it ever reaches this handler -- so a bad upload must be
         # caught here too, not just `InvalidPdfError` itself, or it falls
@@ -182,9 +183,10 @@ async def put_page_map_route(
     session = await _load(db, session_id, user_id)
     try:
         await service.submit_page_map(db, session, body.model_dump(by_alias=True))
-        # Commit BEFORE queuing: the job runs in its own DB session and may
-        # start before `get_db_session` commits this request's, in which case
-        # its claim sees no page map and silently never starts.
+        # Claim and commit BEFORE queuing: the job runs in its own DB session
+        # and may start before `get_db_session` commits this request's. The
+        # claim here also makes this response already read `ocr_running`.
+        claimed = await service.claim_for_ocr(db, session.id)
         await service._safe_commit(db)
     except service.PageMapError as e:
         # Lawyer-entered page/article numbers and fixed Arabic text only.
@@ -193,7 +195,9 @@ async def put_page_map_route(
         ) from e
     except service.SessionStateError as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
-    background.add_task(service.run_ocr_job, session.id)
+    if claimed:
+        background.add_task(service.run_claimed_ocr_job, session.id)
+    db.expire_all()  # the claim was a Core UPDATE; reload the row
     return _detail_out(await _load(db, session_id, user_id))
 
 
@@ -207,7 +211,7 @@ async def thumbnail_route(
 ) -> Response:
     session = await _load(db, session_id, user_id)
     try:
-        png = service.thumbnail(session, upload_id, page)
+        png = await service.thumbnail(session, upload_id, page)
     except service.SessionNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
     except service._StageError as e:
@@ -224,7 +228,10 @@ async def patch_fields_route(
     db: AsyncSession = Depends(get_db_session),
 ) -> DocgenSessionDetailOut:
     session = await _load(db, session_id, user_id)
-    await service.update_fields(db, session, body.fields)
+    try:
+        await service.update_fields(db, session, body.fields)
+    except service.SessionStateError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
     return _detail_out(await _load(db, session_id, user_id))
 
 
@@ -245,6 +252,8 @@ async def patch_article_route(
         )
     except service.SessionNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+    except service.SessionStateError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
     return _article_out(article)
 
 
@@ -256,7 +265,10 @@ async def patch_attendees_route(
     db: AsyncSession = Depends(get_db_session),
 ) -> DocgenSessionDetailOut:
     session = await _load(db, session_id, user_id)
-    await service.update_attendees(db, session, [a.model_dump() for a in body.attendees])
+    try:
+        await service.update_attendees(db, session, [a.model_dump() for a in body.attendees])
+    except service.SessionStateError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
     return _detail_out(await _load(db, session_id, user_id))
 
 
@@ -286,8 +298,13 @@ async def download_route(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="لم يتم إنشاء المستند بعد، أو تم تعديل البيانات بعد إنشائه.",
         )
+    try:
+        content = await service.read_document(session)
+    except service._StageError as e:
+        # Content-free by construction (stage name + exception type).
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
     return Response(
-        content=storage.read(session.document_key),
+        content=content,
         media_type=(
             "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
         ),

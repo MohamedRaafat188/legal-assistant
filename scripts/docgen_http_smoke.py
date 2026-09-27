@@ -185,6 +185,11 @@ async def main() -> int:
 
             r = await client.put(f"{base}/page-map", json=_PAGE_MAP, headers=me)
             check("page map accepted", r.status_code == 200, str(r.status_code))
+            check(
+                "its response already reads ocr_running",
+                r.json().get("status") == "ocr_running",
+                str(r.json().get("status")),
+            )
 
             # Background OCR has run by the time ASGITransport returns.
             r = await client.get(base, headers=me)
@@ -203,6 +208,12 @@ async def main() -> int:
             await service.run_ocr_job(sid)
             r = await client.get(base, headers=me)
             check("a live OCR job is not re-claimed", r.json()["status"] == "ocr_running")
+            r = await client.patch(
+                f"{base}/fields", json={"fields": {"company_name": "x"}}, headers=me
+            )
+            check("an edit during OCR is 409", r.status_code == 409, str(r.status_code))
+            r = await client.post(f"{base}/render", headers=me)
+            check("a render during OCR is 409", r.status_code == 409, str(r.status_code))
             await _force_ocr_running(sid, minutes_ago=60)
             await service.run_ocr_job(sid)
             r = await client.get(base, headers=me)
@@ -264,6 +275,23 @@ async def main() -> int:
             )
             r = await client.get(f"{base}/document", headers=me)
             check("an edit invalidates the rendered document", r.status_code == 404)
+
+            # A new عقد: nothing read from the old one may render as its own.
+            r = await client.post(
+                f"{base}/uploads", data={"kind": "aoa"},
+                files={"file": ("aoa2.pdf", _synthetic_pdf(3), "application/pdf")}, headers=me,
+            )
+            detail = (await client.get(base, headers=me)).json()
+            check(
+                "replacing the عقد drops its articles and extracted values",
+                detail["status"] == "draft"
+                and detail["articles"] == []
+                and "company_name" not in detail["fields"],
+            )
+            check(
+                "but keeps what the lawyer typed",
+                (detail["fields"].get("chairman_name") or {}).get("value") == "رئيس تجريبي",
+            )
         finally:
             r = await client.delete(base, headers=me)
             check("delete 204", r.status_code == 204, str(r.status_code))

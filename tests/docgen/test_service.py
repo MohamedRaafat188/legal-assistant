@@ -610,18 +610,51 @@ def test_ocr_is_live_only_for_a_recently_updated_running_session():
     assert not service._ocr_is_live(_session(status="ready", updated_at=_minutes_ago(1)))
 
 
-def test_get_session_reports_an_abandoned_ocr_job_as_failed():
+def test_an_abandoned_ocr_job_is_shown_as_failed_but_never_written():
     session = _session(status="ocr_running", updated_at=_minutes_ago(30))
     result = asyncio.run(get_session(_FakeDb(session), session_id=1, user_id=7))
-    assert result.status == "failed"
-    assert result.error == service._ABANDONED_OCR
-
-
-def test_get_session_leaves_a_live_ocr_job_running():
-    session = _session(status="ocr_running", updated_at=_minutes_ago(1))
-    result = asyncio.run(get_session(_FakeDb(session), session_id=1, user_id=7))
+    assert service.displayed_status(result) == ("failed", service._ABANDONED_OCR)
+    # A write here could land on a fresh claim and let a second job start.
     assert result.status == "ocr_running"
-    assert result.error is None
+
+
+def test_a_live_ocr_job_is_shown_as_running():
+    session = _session(status="ocr_running", updated_at=_minutes_ago(1))
+    assert service.displayed_status(session) == ("ocr_running", None)
+
+
+def test_edits_are_refused_while_ocr_is_running():
+    # The job rewrites fields and articles from its start-time snapshot.
+    session = _session(status="ocr_running", updated_at=_minutes_ago(1))
+    with pytest.raises(SessionStateError):
+        asyncio.run(service.update_fields(None, session, {"company_name": "x"}))
+    with pytest.raises(SessionStateError):
+        asyncio.run(service.update_article(None, session, 0, new_text="x"))
+    with pytest.raises(SessionStateError):
+        asyncio.run(service.update_attendees(None, session, []))
+
+
+@pytest.mark.parametrize("status", ["failed", "draft"])
+def test_render_refuses_a_session_whose_ocr_has_not_succeeded(status):
+    articles = [
+        DocgenArticle(position=0, article_number=6, is_mukarrar=False, ordinal_words="السادسة",
+                      patched_text="نص قبل", new_text="نص بعد"),
+    ]
+    session, db = _render_session(articles)
+    session.status = status
+    with pytest.raises(SessionStateError):
+        asyncio.run(service.render_session(db, session))
+
+
+def test_render_refuses_a_session_with_no_page_map():
+    articles = [
+        DocgenArticle(position=0, article_number=6, is_mukarrar=False, ordinal_words="السادسة",
+                      patched_text="نص قبل", new_text="نص بعد"),
+    ]
+    session, db = _render_session(articles)
+    session.page_map = None
+    with pytest.raises(SessionStateError):
+        asyncio.run(service.render_session(db, session))
 
 
 def test_claim_for_ocr_statement_can_retake_an_abandoned_session():
@@ -793,7 +826,9 @@ def _render_session(articles):
     fields = DocgenFields(
         session_id=1, data={k: {"value": v, "source": "user"} for k, v in scalars.items()}
     )
-    session = _session(company_type="shakhs_wahed", articles=articles)
+    session = _session(
+        company_type="shakhs_wahed", articles=articles, page_map=_page_map().to_json()
+    )
     return session, _FakeRenderDb(fields)
 
 
@@ -848,3 +883,14 @@ def test_reconcile_capital_still_catches_a_missing_partner_through_percentages()
 def test_reconcile_capital_needs_every_percentage_to_use_them():
     attendees = [{"shares": "٩٠", "percentage": "١٠٠"}, {"shares": "١٠", "percentage": None}]
     assert _reconcile_capital(attendees, "١٠٠٠٠٠") is not None
+
+
+def test_settings_refuse_a_stale_window_that_does_not_outlast_the_timeout(monkeypatch):
+    import pydantic
+
+    from legal_assistant.config import Settings
+
+    monkeypatch.setenv("DOCGEN_OCR_TIMEOUT_MINUTES", "15")
+    monkeypatch.setenv("DOCGEN_OCR_STALE_MINUTES", "15")
+    with pytest.raises(pydantic.ValidationError):
+        Settings()
