@@ -182,6 +182,10 @@ async def put_page_map_route(
     session = await _load(db, session_id, user_id)
     try:
         await service.submit_page_map(db, session, body.model_dump(by_alias=True))
+        # Commit BEFORE queuing: the job runs in its own DB session and may
+        # start before `get_db_session` commits this request's, in which case
+        # its claim sees no page map and silently never starts.
+        await service._safe_commit(db)
     except service.PageMapError as e:
         # Lawyer-entered page/article numbers and fixed Arabic text only.
         raise HTTPException(

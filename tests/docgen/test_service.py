@@ -661,6 +661,13 @@ def test_create_session_allows_masahma_once_switched_on(monkeypatch):
     assert session.company_type == "masahma"
 
 
+def test_session_updates_fetch_the_server_set_updated_at_back():
+    # Otherwise `updated_at` is expired after any flush that updates the row,
+    # and reading it to build a response is a lazy load an AsyncSession
+    # cannot do: every render returned 500 before this.
+    assert DocgenSession.__mapper__.eager_defaults is True
+
+
 def test_validate_source_mode_requires_a_cr_upload_in_aoa_plus_cr_mode():
     with pytest.raises(SessionStateError):
         validate_source_mode("aoa_plus_cr", uploaded_kinds={"aoa"}, typed_cr_no=None)

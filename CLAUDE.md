@@ -35,6 +35,7 @@ python scripts/ask.py --username U --password P    # interactive CLI chat client
 # docgen (قرار/محضر التعديل generation)
 python -m pytest tests/docgen            # offline unit tests, no services needed
 python scripts/docgen_validate.py "عقد تأسيس انجاز.pdf" --company-type zmm --page-map scripts/docgen_page_maps/injaz.json
+python scripts/docgen_http_smoke.py      # every docgen route over HTTP; fake OCR, no cost
 python scripts/docgen_purge.py           # manual retention purge (prod runs it in-process)
 ```
 

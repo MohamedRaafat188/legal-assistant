@@ -86,6 +86,11 @@ class DocgenSession(Base):
         Index("ix_docgen_sessions_user_id", "user_id"),
         Index("ix_docgen_sessions_expires_at", "expires_at"),
     )
+    # Fetch server-set `updated_at` back (RETURNING) on every UPDATE. Without
+    # it the attribute is expired after a flush, and the next sync read --
+    # e.g. building the response after a render -- is a lazy load, which an
+    # AsyncSession cannot do (MissingGreenlet, a 500).
+    __mapper_args__ = {"eager_defaults": True}
 
 
 class DocgenUpload(Base):

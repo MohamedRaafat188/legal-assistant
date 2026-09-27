@@ -198,7 +198,7 @@ For the RAG chat pipeline, no pytest suite exists (there is no isolated unit-tes
 - `scripts/check_retrieval.py` — proves the retrieval path (hybrid search → rerank → exact lookup) against Qdrant Cloud with real sample queries.
 - `scripts/check_embedding_consistency.py` — proves the deployed embedding service produces vectors numerically consistent with what's already stored in Qdrant Cloud.
 
-`docgen` (Phase 10, below) is different: `tests/docgen/` is a real, offline `pytest` suite (no services needed — every LLM call is faked), while `scripts/docgen_validate.py` fills the same live-stack role as `phase4_validate.py` and friends.
+`docgen` (Phase 10, below) is different: `tests/docgen/` is a real, offline `pytest` suite (no services needed — every LLM call is faked), while `scripts/docgen_validate.py` fills the same live-stack role as `phase4_validate.py` and friends. `scripts/docgen_http_smoke.py` drives every docgen route in-process over HTTP against the local database with a fake OCR provider and fictional content (no cost, no real data): status codes, the 422 page-map problem list, thumbnail headers, ownership isolation, render/download, and recovery of an OCR job abandoned by a restart.
 
 ---
 
