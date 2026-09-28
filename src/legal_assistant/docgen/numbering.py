@@ -105,6 +105,30 @@ def article_name(n: int, mukarrar: bool = False) -> str:
     return f"{name} مكرر" if mukarrar else name
 
 
+def article_label(n: int, mukarrar: bool = False) -> str:
+    """Numeric reference to one article, as the ذ.م.م محضر writes it:
+    "المادة (3)" / "المادة (3) مكرر"."""
+    name = f"المادة ({n})"
+    return f"{name} مكرر" if mukarrar else name
+
+
+_DECISIONS = (
+    "أولاً", "ثانياً", "ثالثاً", "رابعاً", "خامساً",
+    "سادساً", "سابعاً", "ثامناً", "تاسعاً", "عاشراً",
+)
+_DECISION_TEENS = ("حادي", "ثاني", "ثالث", "رابع", "خامس", "سادس", "سابع", "ثامن", "تاسع")
+
+
+def decision_ordinal(n: int) -> str:
+    """Heading of the n-th decision in a محضر: "أولاً", "ثانياً", ...
+    "حادي عشر", ... "عشرون"; digits past that."""
+    if 1 <= n <= 10:
+        return _DECISIONS[n - 1]
+    if 11 <= n <= 19:
+        return f"{_DECISION_TEENS[n - 11]} عشر"
+    return "عشرون" if n == 20 else str(n)
+
+
 def articles_title(numbers: Sequence[ArticleRef | int]) -> str:
     """Heading fragment naming every amended article.
 

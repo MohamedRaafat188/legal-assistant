@@ -2,8 +2,10 @@ import pytest
 
 from legal_assistant.docgen.numbering import (
     ArticleRef,
+    article_label,
     article_name,
     articles_title,
+    decision_ordinal,
     ordinal_words,
     parse_article_number,
     parse_article_ref,
@@ -103,3 +105,17 @@ def test_articles_title_orders_mukarrar_after_its_base_article():
 
 def test_articles_title_still_accepts_plain_ints():
     assert articles_title([6, 7]) == "المواد السادسة والسابعة"
+
+
+def test_article_label_is_numeric_with_mukarrar():
+    assert article_label(3) == "المادة (3)"
+    assert article_label(6, mukarrar=True) == "المادة (6) مكرر"
+
+
+@pytest.mark.parametrize(
+    ("n", "expected"),
+    [(1, "أولاً"), (3, "ثالثاً"), (10, "عاشراً"), (11, "حادي عشر"), (19, "تاسع عشر"),
+     (20, "عشرون"), (21, "21")],
+)
+def test_decision_ordinal(n, expected):
+    assert decision_ordinal(n) == expected

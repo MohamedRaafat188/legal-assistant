@@ -252,18 +252,40 @@ async def main() -> int:
                 json={
                     "fields": {
                         "commercial_registration_no": "12345",
-                        "commercial_registration_date": "2020/01/01",
+                        "commercial_registry_office": "استثمار تجريبي",
                         "day_name": "الأحد",
                         "day_date": "2026/09/06",
                         "names_of_commissioners": "مفوض تجريبي",
                         "chairman_name": "رئيس تجريبي",
-                        "meeting_time": "العاشرة صباحا",
-                        "meeting_end_time": "الحادية عشرة صباحا",
+                        "chairman_title": "السيد",
+                        "auditor_name": "الأستاذ/ مراقب تجريبي",
+                        "secretary_name": "أمين سر تجريبي",
+                        "vote_counter_1": "فارز تجريبي",
+                        "vote_counter_2": "فارز تجريبي آخر",
                     }
                 },
                 headers=me,
             )
             check("patch fields", r.status_code == 200, str(r.status_code))
+
+            r = await client.post(f"{base}/render", headers=me)
+            check(
+                "render with an untitled partner is 409",
+                r.status_code == 409 and "اللقب" in r.json()["detail"],
+                str(r.status_code),
+            )
+            roster = [
+                {**p, "title": "السيد"}
+                for p in (await client.get(base, headers=me)).json()["fields"]["attendees"]
+            ]
+            r = await client.patch(f"{base}/attendees", json={"attendees": roster}, headers=me)
+            check("patch attendees with titles", r.status_code == 200, str(r.status_code))
+            r = await client.patch(
+                f"{base}/attendees",
+                json={"attendees": [{**roster[0], "title": "الأستاذ"}]},
+                headers=me,
+            )
+            check("an unknown title is 422", r.status_code == 422, str(r.status_code))
 
             r = await client.post(f"{base}/render", headers=me)
             check("render 200", r.status_code == 200, f"{r.status_code} {r.text[:200]}")

@@ -36,7 +36,7 @@ from sqlalchemy.orm import selectinload
 from legal_assistant.config import get_settings
 from legal_assistant.db.session import get_sessionmaker
 from legal_assistant.docgen import pages, pdf, storage
-from legal_assistant.docgen.arabic import to_ascii_digits
+from legal_assistant.docgen.arabic import normalize_for_match, to_ascii_digits
 from legal_assistant.docgen.models import (
     DocgenArticle,
     DocgenFields,
@@ -47,7 +47,12 @@ from legal_assistant.docgen.models import (
     UploadKind,
     default_expires_at,
 )
-from legal_assistant.docgen.numbering import ArticleRef, article_name, ordinal_words
+from legal_assistant.docgen.numbering import (
+    ArticleRef,
+    article_label,
+    article_name,
+    ordinal_words,
+)
 from legal_assistant.docgen.ocr.base import OcrError, get_provider
 from legal_assistant.docgen.pages import (
     PREAMBLE,
@@ -70,6 +75,7 @@ from legal_assistant.docgen.pdf import InvalidPdfError
 from legal_assistant.docgen.render import (
     ArticleBlock,
     Attendee,
+    MissingContextError,
     build_context,
     render_document,
 )
@@ -1228,6 +1234,51 @@ async def update_attendees(
 # --- render ------------------------------------------------------------------
 
 
+# Arabic names for the render error that lists empty fields.
+_FIELD_LABELS = {
+    "company_name": "اسم الشركة",
+    "law_number": "رقم القانون",
+    "law_year": "سنة القانون",
+    "commercial_registration_no": "رقم السجل التجاري",
+    "commercial_registration_date": "تاريخ القيد بالسجل التجاري",
+    "commercial_registry_office": "مكتب السجل التجاري",
+    "day_name": "يوم الاجتماع",
+    "day_date": "تاريخ الاجتماع",
+    "company_address": "عنوان المركز الرئيسي",
+    "owner_name": "اسم مالك الشركة",
+    "names_of_commissioners": "أسماء المفوضين",
+    "chairman_name": "رئيس الاجتماع",
+    "chairman_title": "لقب رئيس الاجتماع",
+    "auditor_name": "مراقب الحسابات",
+    "secretary_name": "أمين السر",
+    "vote_counter_1": "فارز الأصوات الأول",
+    "vote_counter_2": "فارز الأصوات الثاني",
+    "meeting_time": "وقت بدء الاجتماع",
+    "meeting_end_time": "وقت انتهاء الاجتماع",
+    "attendance_percentage": "نسبة الحضور",
+    "approval_percentage": "نسبة الموافقة",
+    "attendees": "جدول الحضور",
+    "articles": "المواد المعدلة",
+}
+
+
+def _as_percentage(value: str) -> str:
+    """"100" / "100%" / "١٠٠ ٪" -> "100%" (empty stays empty): the templates
+    print the figure without a sign of their own."""
+    figure = to_ascii_digits(str(value or "")).replace("%", "").replace("٪", "").strip()
+    return f"{figure}%" if figure else ""
+
+
+def attendee_role(name: str, chairman_name: str) -> str:
+    """«مدير الشركة» for the partner who chairs the meeting, «شريك» for the
+    rest. The ذ.م.م محضر names its chairman as the company's manager, so the
+    two are the same person; names compare with spelling variants folded."""
+    same = bool(chairman_name.strip()) and normalize_for_match(name) == normalize_for_match(
+        chairman_name
+    )
+    return "مدير الشركة" if same else "شريك"
+
+
 async def render_session(db: AsyncSession, session: DocgenSession) -> bytes:
     """Render the document. Idempotent and re-runnable.
 
@@ -1280,7 +1331,28 @@ async def render_session(db: AsyncSession, session: DocgenSession) -> bytes:
         attendance, approval = compute_percentages(attendees_data)
         scalars.setdefault("attendance_percentage", attendance or "")
         scalars.setdefault("approval_percentage", approval or "")
+        for name in ("attendance_percentage", "approval_percentage"):
+            scalars[name] = _as_percentage(scalars[name])
+    if "p.title" in spec.attendee_placeholders:
+        untitled = [p.get("name", "") for p in attendee_rows if not (p.get("title") or "").strip()]
+        if untitled:
+            raise SessionStateError(
+                "اختر اللقب (السيد / السيدة / السادة) في جدول الشركاء لـ: " + "، ".join(untitled)
+            )
+    for name in ("law_number", "law_year"):
+        scalars[name] = to_ascii_digits(scalars.get(name, ""))
 
+    chairman = scalars.get("chairman_name", "")
+    if "chairman_title" in spec.scalar_placeholders and not scalars.get("chairman_title"):
+        # The chairman is normally a partner: reuse the title chosen for them.
+        scalars["chairman_title"] = next(
+            (
+                (p.get("title") or "").strip()
+                for p in attendee_rows
+                if attendee_role(p.get("name", ""), chairman) == "مدير الشركة"
+            ),
+            "",
+        )
     context = build_context(
         session.company_type,
         scalars=scalars,
@@ -1289,6 +1361,7 @@ async def render_session(db: AsyncSession, session: DocgenSession) -> bytes:
                 article_name=article_name(a.article_number, a.is_mukarrar),
                 article_original_content=a.patched_text,
                 article_new_content=a.new_text or "",
+                article_label=article_label(a.article_number, a.is_mukarrar),
             )
             for a in articles
         ],
@@ -1298,12 +1371,18 @@ async def render_session(db: AsyncSession, session: DocgenSession) -> bytes:
                 name=p.get("name", ""),
                 shares=str(p.get("shares") or ""),
                 percentage=str(p.get("percentage") or ""),
+                title=(p.get("title") or "").strip(),
+                role=attendee_role(p.get("name", ""), chairman),
             )
             for p in attendee_rows
         ],
     )
 
-    document = await asyncio.to_thread(render_document, session.company_type, context)
+    try:
+        document = await asyncio.to_thread(render_document, session.company_type, context)
+    except MissingContextError as e:
+        names = "، ".join(_FIELD_LABELS.get(n, n) for n in sorted(e.missing))
+        raise SessionStateError(f"أكمل البيانات التالية قبل إنشاء المستند: {names}") from e
     previous_key = session.document_key
     key = storage.new_key(session.id, "document")
     # Write the NEW object and commit the pointer to it before touching the

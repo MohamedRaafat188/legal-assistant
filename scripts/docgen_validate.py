@@ -182,6 +182,15 @@ async def run(
                         ],
                     )
 
+            if "p.title" in spec.attendee_placeholders:
+                # The lawyer picks each partner's title; the validation run
+                # uses the neutral «السادة» rather than guess anyone's.
+                roster = (session.fields.data if session.fields else {}).get("attendees") or []
+                if roster:
+                    await service.update_attendees(
+                        db, session, [{**p, "title": p.get("title") or "السادة"} for p in roster]
+                    )
+
             # Only what a lawyer always types: nothing here is in the عقد.
             await service.update_fields(
                 db,
@@ -194,6 +203,10 @@ async def run(
                     "names_of_commissioners": "أحمد كامل",
                     # Generic, fictional names -- never values from the samples.
                     "chairman_name": "محمود عبد الرحمن",
+                    "chairman_title": "السيد",
+                    "commercial_registry_office": "استثمار القاهرة",
+                    "vote_counter_1": "محمد سمير",
+                    "vote_counter_2": "هاني نبيل",
                     "meeting_time": "الحادية عشرة صباحا",
                     "meeting_end_time": "الواحدة ظهرا",
                     "secretary_name": "سارة على",

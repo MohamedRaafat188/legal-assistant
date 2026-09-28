@@ -1,3 +1,4 @@
+import docx
 import pytest
 
 from legal_assistant.docgen.templates.registry import (
@@ -52,6 +53,32 @@ def test_zmm_declares_partner_attendees():
     spec = get_template("zmm")
     assert spec.attendee_label == "partner"
     assert "chairman_name" in spec.scalar_placeholders
+
+
+def test_zmm_follows_the_filed_layout():
+    # Partners by title and role, the meeting's officers named, articles as
+    # numbered decisions; no meeting times and no CR date.
+    spec = get_template("zmm")
+    assert spec.attendee_placeholders == {"p.title", "p.name", "p.role"}
+    assert spec.article_placeholders == {
+        "a.ordinal",
+        "a.article_label",
+        "a.article_original_content",
+        "a.article_new_content",
+    }
+    for name in ("auditor_name", "secretary_name", "vote_counter_1", "vote_counter_2",
+                 "commercial_registry_office", "chairman_title", "authorization_ordinal"):
+        assert name in spec.scalar_placeholders
+    for name in ("meeting_time", "meeting_end_time", "commercial_registration_date"):
+        assert name not in spec.scalar_placeholders
+
+
+def test_placeholder_names_may_contain_digits(tmp_path):
+    document = docx.Document()
+    document.add_paragraph("{{ vote_counter_1 }} و {{ vote_counter_2 }}")
+    path = tmp_path / "t.docx"
+    document.save(path)
+    assert placeholders_in(path) == {"vote_counter_1", "vote_counter_2"}
 
 
 def test_masahma_declares_shareholder_attendees_and_its_extra_officers():

@@ -15,7 +15,7 @@ from dataclasses import dataclass
 
 FILES = pathlib.Path(__file__).resolve().parent / "files"
 
-_VAR = re.compile(r"\{\{\s*([a-z_][a-z_.]*)\s*\}\}")
+_VAR = re.compile(r"\{\{\s*([a-z_][a-z0-9_.]*)\s*\}\}")
 
 
 class CompanyType(enum.StrEnum):
@@ -82,6 +82,38 @@ _ARTICLE_FIELDS = frozenset(
 )
 _ATTENDEE_FIELDS = frozenset({"p.name", "p.shares", "p.percentage"})
 
+# The ذ.م.م محضر follows the layout lawyers file at GAFI: the partners are
+# listed by title and role (no share table), the auditor, secretary and two
+# vote counters are named, each article is its own numbered decision
+# («أولاً: الموافقة على تعديل المادة (3)»), and the authorization is the
+# decision after the last article. No meeting times and no CR date.
+_ZMM_SCALARS = frozenset(
+    {
+        "company_name",
+        "law_number",
+        "law_year",
+        "commercial_registration_no",
+        "commercial_registry_office",
+        "day_name",
+        "day_date",
+        "company_address",
+        "chairman_name",
+        "chairman_title",
+        "auditor_name",
+        "secretary_name",
+        "vote_counter_1",
+        "vote_counter_2",
+        "attendance_percentage",
+        "approval_percentage",
+        "names_of_commissioners",
+        "authorization_ordinal",
+    }
+)
+_ZMM_ARTICLE_FIELDS = frozenset(
+    {"a.ordinal", "a.article_label", "a.article_original_content", "a.article_new_content"}
+)
+_ZMM_ATTENDEE_FIELDS = frozenset({"p.title", "p.name", "p.role"})
+
 _SPECS: dict[CompanyType, TemplateSpec] = {
     CompanyType.SHAKHS_WAHED: TemplateSpec(
         company_type=CompanyType.SHAKHS_WAHED,
@@ -94,9 +126,9 @@ _SPECS: dict[CompanyType, TemplateSpec] = {
     CompanyType.ZMM: TemplateSpec(
         company_type=CompanyType.ZMM,
         path=FILES / "محضر_تعديل_شركة_ذات_مسئولية_محدودة_template.docx",
-        scalar_placeholders=_COMMON_SCALARS | _MEETING_SCALARS | {"company_address"},
-        article_placeholders=_ARTICLE_FIELDS,
-        attendee_placeholders=_ATTENDEE_FIELDS,
+        scalar_placeholders=_ZMM_SCALARS,
+        article_placeholders=_ZMM_ARTICLE_FIELDS,
+        attendee_placeholders=_ZMM_ATTENDEE_FIELDS,
         attendee_label="partner",
     ),
     CompanyType.MASAHMA: TemplateSpec(

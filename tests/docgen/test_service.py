@@ -12,6 +12,7 @@ from legal_assistant.docgen.parsing.commercial_register import CompanyRecord
 from legal_assistant.docgen.parsing.scoped import AoaExtraction
 from legal_assistant.docgen.parsing.signatures import Concept
 from legal_assistant.docgen.patching import Replacement
+from legal_assistant.docgen.render import document_text
 from legal_assistant.docgen.service import (
     SessionNotFoundError,
     SessionStateError,
@@ -873,6 +874,84 @@ def test_render_session_names_every_article_missing_its_new_text():
     with pytest.raises(SessionStateError) as info:
         asyncio.run(service.render_session(db, session))
     assert str(info.value).endswith("المادة السادسة مكرر، المادة السابعة")
+
+
+def _zmm_render_session(attendees, **overrides):
+    scalars = {
+        "commercial_registration_no": "12345", "commercial_registry_office": "استثمار الجيزة",
+        "company_name": "تجريبية للتجارة", "company_address": "عنوان تجريبي",
+        "law_number": "١٥٩", "law_year": "١٩٨١", "day_date": "2026/9/26", "day_name": "السبت",
+        "names_of_commissioners": "مفوض تجريبي", "chairman_name": "سامي فوزى",
+        "auditor_name": "الأستاذ/ مراقب تجريبي", "secretary_name": "أمين تجريبي",
+        "vote_counter_1": "فارز أول", "vote_counter_2": "فارز ثان", "issued_capital": "١٠٠",
+        **overrides,
+    }
+    data = {k: {"value": v, "source": "user"} for k, v in scalars.items()}
+    data["attendees"] = attendees
+    articles = [
+        DocgenArticle(position=0, article_number=3, is_mukarrar=False, ordinal_words="الثالثة",
+                      patched_text="غرض قديم.", new_text="غرض جديد."),
+    ]
+    session = _session(company_type="zmm", articles=articles, page_map=_page_map().to_json())
+    return session, _FakeRenderDb(DocgenFields(session_id=1, data=data))
+
+
+_PARTNERS = [
+    {"name": "سامي فوزي", "shares": "٥٠", "percentage": "٥٠", "title": "السيد"},
+    {"name": "ليلى حسن", "shares": "٥٠", "percentage": "٥٠", "title": "السيدة"},
+]
+
+
+def test_render_session_zmm_titles_roles_and_percentages(monkeypatch):
+    written = {}
+    monkeypatch.setattr(storage, "write", lambda key, data: written.update(doc=data))
+    session, db = _zmm_render_session(_PARTNERS)
+    asyncio.run(service.render_session(db, session))
+    text = document_text(written["doc"])
+    # «فوزى» typed, «فوزي» in the table: still the chairman.
+    assert "السيد/ سامي فوزي\n(مدير الشركة)" in text
+    assert "السيدة/ ليلى حسن\n(شريك)" in text
+    # The chairman's title comes from his row in the partner table.
+    assert "دعوة السيد/ سامي فوزى بصفته مدير شركة/" in text
+    assert "نسبة حضور الشركاء 100%." in text
+    assert "للقانون رقم 159 لسنة 1981" in text
+    assert "أولاً: الموافقة على تعديل المادة (3)" in text
+
+
+def test_render_session_zmm_refuses_a_partner_without_a_title():
+    partners = [dict(_PARTNERS[0]), {**_PARTNERS[1], "title": None}]
+    session, db = _zmm_render_session(partners)
+    with pytest.raises(SessionStateError) as info:
+        asyncio.run(service.render_session(db, session))
+    assert "ليلى حسن" in str(info.value)
+
+
+def test_render_session_names_the_empty_fields_instead_of_failing():
+    session, db = _zmm_render_session(_PARTNERS, auditor_name="", vote_counter_2="")
+    with pytest.raises(SessionStateError) as info:
+        asyncio.run(service.render_session(db, session))
+    assert "مراقب الحسابات" in str(info.value)
+    assert "فارز الأصوات الثاني" in str(info.value)
+
+
+def test_render_session_needs_a_chairman_title_when_the_chairman_is_not_a_partner():
+    session, db = _zmm_render_session(_PARTNERS, chairman_name="مدير من خارج الشركاء")
+    with pytest.raises(SessionStateError) as info:
+        asyncio.run(service.render_session(db, session))
+    assert "لقب رئيس الاجتماع" in str(info.value)
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"), [("100", "100%"), ("100%", "100%"), ("١٠٠ ٪", "100%"), ("", "")]
+)
+def test_as_percentage_prints_one_sign(raw, expected):
+    assert service._as_percentage(raw) == expected
+
+
+def test_attendee_role_folds_spelling_variants_and_needs_a_chairman():
+    assert service.attendee_role("أحمد علي", "احمد على") == "مدير الشركة"
+    assert service.attendee_role("أحمد علي", "سامي فوزي") == "شريك"
+    assert service.attendee_role("أحمد علي", "") == "شريك"
 
 
 def test_reconcile_capital_accepts_shares_worth_more_than_a_pound_via_percentages():

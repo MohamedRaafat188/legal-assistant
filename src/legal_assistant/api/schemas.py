@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime
 import re
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -179,6 +180,8 @@ class DocgenAttendee(BaseModel):
     shares: str | None = None
     percentage: str | None = None
     attending: bool = True
+    # السيد / السيدة / السادة: the ذ.م.م محضر lists each partner with it.
+    title: Literal["السيد", "السيدة", "السادة"] | None = None
 
 
 class DocgenAttendeesPatchRequest(BaseModel):

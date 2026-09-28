@@ -20,7 +20,7 @@ from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docxtpl import DocxTemplate
 
-from legal_assistant.docgen.numbering import ArticleRef, articles_title
+from legal_assistant.docgen.numbering import ArticleRef, articles_title, decision_ordinal
 from legal_assistant.docgen.parsing.commercial_register import is_separator_row, table_cells
 from legal_assistant.docgen.templates.registry import get_template
 
@@ -32,13 +32,17 @@ class ArticleBlock:
     article_name: str
     article_original_content: str
     article_new_content: str
+    # "المادة (3)": the ذ.م.م محضر names articles by number, not in words.
+    article_label: str = ""
 
 
 @dataclass(frozen=True)
 class Attendee:
     name: str
-    shares: str
-    percentage: str
+    shares: str = ""
+    percentage: str = ""
+    title: str = ""  # السيد / السيدة / السادة, chosen by the lawyer
+    role: str = ""  # مدير الشركة / شريك
 
 
 class MissingContextError(RuntimeError):
@@ -61,15 +65,20 @@ def build_context(
 ) -> dict:
     """Assemble the docxtpl context.
 
-    `articles_title` is computed here rather than passed in, so the heading
-    can never disagree with the articles actually in the document.
+    `articles_title` and the decision ordinals are computed here rather than
+    passed in, so the headings can never disagree with the articles actually
+    in the document: article i is decision i («أولاً», «ثانياً», ...) and the
+    authorization is the decision after the last article.
     """
     if not articles:
         raise ValueError("a قرار/محضر التعديل must amend at least one article")
     return {
         **scalars,
         "articles_title": articles_title(article_numbers),
-        "articles": [asdict(a) for a in articles],
+        "authorization_ordinal": decision_ordinal(len(articles) + 1),
+        "articles": [
+            {**asdict(a), "ordinal": decision_ordinal(i)} for i, a in enumerate(articles, 1)
+        ],
         "attendees": [asdict(p) for p in attendees],
     }
 
