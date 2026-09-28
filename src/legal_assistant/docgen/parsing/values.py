@@ -88,7 +88,40 @@ def current_value(field_name: str, article_text: str) -> str:
         return match.group("v").strip() if match else ""
     if field_name == "company_name":
         match = re.search(
-            r"(?:اسم الشركة|تسمى الشركة)\s*(?:هو|:)?\s*(?P<v>[^.\n]+)", article_text
+            r"(?:اسم الشركة|تسمى الشركة)\s*(?:هو|:)?\s*"
+            # A «.» ends the name, except inside «ش.ذ.م.م».
+            r"(?P<v>(?:[^.\n]|\.(?=\s*[ذم]\s*\.|\s*م\s*\)?))+)",
+            article_text,
         )
-        return match.group("v").strip() if match else ""
+        return _bare_company_name(match.group("v")) if match else ""
     return ""
+
+
+# «اسم الشركة هو : - النور ... شركة ذات مسئولية محدودة»: the templates write
+# «شركة» and the company's legal form themselves, so the name is read without
+# the dash the عقد puts before it, a leading «شركة», and the form after it.
+_NAME_EDGE = re.compile(r"^[\s:：\-–—ـ/«\"]+|[\s.،,:：\-–—ـ/»\"]+$")
+_LEGAL_FORM = re.compile(
+    r"[\s\-–—،,(]*(?:شركة\s+)?(?:"
+    r"(?:ذات|ذ)\s+(?:ال)?مس[ئؤ]ولي[ةه]\s+(?:ال)?محدود[ةه]"
+    r"|ش\s*\.\s*ذ\s*\.\s*م\s*\.\s*م\s*\.?"
+    r"|ذ\s*\.\s*م\s*\.\s*م\s*\.?"
+    r"|شخص\s+واحد"
+    r")\s*\)?\s*$"
+)
+# «شركة النور»: every template already writes «شركة» / «لشركة/» before it.
+_LEADING_SHARIKA = re.compile(r"^شركة\s+")
+
+
+def _bare_company_name(value: str) -> str:
+    """The name with its edge punctuation and trailing legal form removed; a
+    verbatim substring of `value`. Falls back to the edge-trimmed value when
+    nothing but the form is left."""
+    trimmed = _NAME_EDGE.sub("", value)
+    name = trimmed
+    while True:
+        shorter = _NAME_EDGE.sub("", _LEADING_SHARIKA.sub("", _LEGAL_FORM.sub("", name)))
+        if shorter == name:
+            break
+        name = shorter
+    return name or trimmed

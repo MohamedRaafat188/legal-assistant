@@ -26,21 +26,31 @@ SHAKHS_WAHED_SCALARS = {
 }
 
 ZMM_SCALARS = {
-    "company_name": "شركة إنجاز",
+    "company_name": "إنجاز للتجارة",
     "law_number": "159",
     "law_year": "1981",
     "commercial_registration_no": "303907",
-    "commercial_registration_date": "2021/03/14",
+    "commercial_registry_office": "استثمار الجيزة",
     "day_name": "الأحد",
     "day_date": "2026/09/06",
     "names_of_commissioners": "أحمد كامل",
-    "meeting_time": "الحادية عشرة صباحا",
-    "meeting_end_time": "الواحدة ظهرا",
     "chairman_name": "مايكل فوزى",
-    "attendance_percentage": "100",
-    "approval_percentage": "100",
+    "chairman_title": "السيد",
+    "auditor_name": "الأستاذ/ كمال حسن",
+    "secretary_name": "هاني نبيل",
+    "vote_counter_1": "رامي عادل",
+    "vote_counter_2": "منى سمير",
+    "attendance_percentage": "100%",
+    "approval_percentage": "100%",
     "company_address": "٤٠ شارع الهرم، الجيزة",
 }
+
+
+def _zmm_articles():
+    return [
+        ArticleBlock("المادة السادسة", "النص القديم للمادة السادسة.", "النص الجديد.", "المادة (6)"),
+        ArticleBlock("المادة السابعة", "النص القديم للمادة السابعة.", "نص جديد آخر.", "المادة (7)"),
+    ]
 
 
 def _articles():
@@ -104,22 +114,55 @@ def test_render_a_single_article_uses_the_singular_heading():
     assert "المواد" not in text
 
 
-def test_render_zmm_emits_one_table_row_per_attendee():
+def test_render_zmm_lists_each_attendee_with_title_and_role():
     attendees = [
-        Attendee("مايكل فوزى", "٩٠", "٩٠"),
-        Attendee("مايكل مجدى", "١٠", "١٠"),
+        Attendee("مايكل فوزى", "٩٠", "٩٠", title="السيد", role="مدير الشركة"),
+        Attendee("سارة مجدى", "١٠", "١٠", title="السيدة", role="شريك"),
     ]
     context = build_context(
         "zmm",
         scalars=ZMM_SCALARS,
-        articles=_articles()[:1],
+        articles=_zmm_articles()[:1],
         article_numbers=[6],
         attendees=attendees,
     )
     text = document_text(render_document("zmm", context))
-    assert "مايكل فوزى" in text
-    assert "مايكل مجدى" in text
-    assert "{{" not in text
+    assert "السيد/ مايكل فوزى\n(مدير الشركة)" in text
+    assert "السيدة/ سارة مجدى\n(شريك)" in text
+    assert "{{" not in text and "{%" not in text
+
+
+def test_render_zmm_numbers_each_article_as_a_decision_then_the_authorization():
+    context = build_context(
+        "zmm",
+        scalars=ZMM_SCALARS,
+        articles=_zmm_articles(),
+        article_numbers=[6, 7],
+        attendees=[Attendee("مايكل فوزى", title="السيد", role="مدير الشركة")],
+    )
+    text = document_text(render_document("zmm", context))
+    assert "أولاً: الموافقة على تعديل المادة (6) من النظام الأساسي للشركة" in text
+    assert "ثانياً: الموافقة على تعديل المادة (7) من النظام الأساسي للشركة" in text
+    assert "المادة (7) قبل التعديل:" in text and "المادة (7) بعد التعديل:" in text
+    assert "ثالثاً: تفويض كلٍّ من السادة/ أحمد كامل" in text
+    assert "سجل تجاري رقم 303907 استثمار الجيزة" in text
+    assert "حيث بلغت نسبة حضور الشركاء 100%." in text
+    assert "الأستاذ/ كمال حسن\n(مراقب الحسابات)" in text
+    assert "بصفته مدير شركة/ إنجاز للتجارة شركة ذات مسئولية محدودة" in text
+
+
+def test_render_zmm_writes_the_feminine_capacity_for_a_woman_chairing():
+    scalars = {**ZMM_SCALARS, "chairman_name": "سارة مجدى", "chairman_title": "السيدة"}
+    context = build_context(
+        "zmm",
+        scalars=scalars,
+        articles=_zmm_articles()[:1],
+        article_numbers=[6],
+        attendees=[Attendee("سارة مجدى", title="السيدة", role="مدير الشركة")],
+    )
+    text = document_text(render_document("zmm", context))
+    assert "دعوة السيدة/ سارة مجدى بصفتها مدير شركة/" in text
+    assert "بصفته " not in text
 
 
 def test_render_raises_when_a_declared_scalar_is_missing():
@@ -185,7 +228,7 @@ def test_render_document_fails_closed_on_missing_attendees_for_zmm():
     context = build_context(
         "zmm",
         scalars=ZMM_SCALARS,
-        articles=_articles()[:1],
+        articles=_zmm_articles()[:1],
         article_numbers=[6],
         attendees=[],
     )
@@ -209,11 +252,11 @@ def test_render_document_does_not_require_attendees_for_shakhs_wahed():
 
 
 def test_render_zmm_puts_company_address_in_the_footer_with_no_stray_braces():
-    attendees = [Attendee("مايكل فوزى", "١٠٠", "١٠٠")]
+    attendees = [Attendee("مايكل فوزى", "١٠٠", "١٠٠", title="السيد", role="مدير الشركة")]
     context = build_context(
         "zmm",
         scalars=ZMM_SCALARS,
-        articles=_articles()[:1],
+        articles=_zmm_articles()[:1],
         article_numbers=[6],
         attendees=attendees,
     )

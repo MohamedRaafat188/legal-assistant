@@ -1,5 +1,7 @@
 import pathlib
 
+import pytest
+
 from legal_assistant.docgen.parsing.values import current_value, law_reference, owner_name
 
 FIXTURES = pathlib.Path(__file__).parents[1] / "fixtures" / "docgen"
@@ -57,3 +59,23 @@ def test_owner_name_from_a_founder_table_with_a_hamza_header():
         "| ١ | محمد أحمد علي حسن | مصري |\n"
     )
     assert owner_name(text) == "محمد أحمد علي حسن"
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        # The dash before the name and the legal form after it are not the name.
+        ("اسم الشركة هو : - النور للتوزيع Nour Trading شركة ذات مسئولية محدودة",
+         "النور للتوزيع Nour Trading"),
+        ("تسمى الشركة: شركة النور للتوزيع (ش.ذ.م.م).\nالمادة", "النور للتوزيع"),
+        ("اسم الشركة هو النور شركة شخص واحد ذات مسئولية محدودة.", "النور"),
+        ("اسم الشركة هو: - مصر للتجارة - شركة ذات مسؤولية محدودة", "مصر للتجارة"),
+        ("اسم الشركة هو مصر للاستثمار. وتكون", "مصر للاستثمار"),
+        # Nothing but the form: keep it rather than return nothing.
+        ("اسم الشركة : شركة ذات مسئولية محدودة", "شركة ذات مسئولية محدودة"),
+    ],
+)
+def test_company_name_drops_edge_punctuation_and_legal_form(text, expected):
+    value = current_value("company_name", text)
+    assert value == expected
+    assert value in text  # still a verbatim span: patching replaces it in place
