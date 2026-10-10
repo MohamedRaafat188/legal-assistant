@@ -76,13 +76,20 @@ def test_enums_carry_the_spec_values():
     assert {k.value for k in UploadKind} == {"aoa", "commercial_register"}
 
 
-def test_default_expires_at_is_two_days_ahead_and_tz_aware():
-    expires = default_expires_at(2)
+def test_default_expires_at_is_hours_ahead_and_tz_aware():
+    expires = default_expires_at(4)
     now = datetime.datetime.now(datetime.UTC)
     assert expires.tzinfo is not None
-    assert (
-        datetime.timedelta(days=1, hours=23) < expires - now < datetime.timedelta(days=2, hours=1)
-    )
+    lower, upper = datetime.timedelta(hours=3, minutes=59), datetime.timedelta(hours=4, minutes=1)
+    assert lower < expires - now < upper
+
+
+def test_settings_default_to_a_four_hour_window_purged_every_quarter_hour():
+    from legal_assistant.config import Settings
+
+    fields = Settings.model_fields
+    assert fields["docgen_retention_hours"].default == 4
+    assert fields["docgen_purge_interval_minutes"].default == 15
 
 
 def test_articles_are_indexed_by_session_and_number():

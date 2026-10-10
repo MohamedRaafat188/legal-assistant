@@ -451,15 +451,15 @@ async def create_session(
         company_type=company_type,
         source_mode=source_mode,
         status=SessionStatus.draft.value,
-        # The 2-day retention window is a deliberate, user-mandated ceiling
+        # The retention window is a deliberate, user-mandated ceiling
         # (uploaded documents carry partners' national ID and passport
-        # numbers) that a 30-day proposal was explicitly rejected in favour
-        # of. `default_expires_at` takes the window as a parameter and the
+        # numbers): 2 days at launch, cut to 4 hours to keep the volume
+        # small. `default_expires_at` takes the window as a parameter and the
         # column has no server-side default, so THIS call site is the only
-        # place that window is enforced. `docgen_retention_days` defaults to
-        # 2 in `Settings` and is documented in `.env.example`; nothing else
+        # place that window is enforced. `docgen_retention_hours` defaults to
+        # 4 in `Settings` and is documented in `.env.example`; nothing else
         # in this module may compute or override `expires_at`.
-        expires_at=default_expires_at(settings.docgen_retention_days),
+        expires_at=default_expires_at(settings.docgen_retention_hours),
     )
     db.add(session)
     await _safe_flush(db)
