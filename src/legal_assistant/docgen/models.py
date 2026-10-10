@@ -4,7 +4,8 @@ Sessions are resumable, so everything the review screen shows survives a
 reload: extracted articles with their patch ops and confidence, identity
 fields with their provenance, and the page map that produced them. Uploaded
 FILES live on disk under `storage_key`, never in the DB -- they carry
-national ID and passport numbers and are purged after two days.
+national ID and passport numbers and are purged after a few hours
+(`docgen_retention_hours`).
 """
 
 from __future__ import annotations
@@ -41,9 +42,9 @@ class UploadKind(enum.StrEnum):
     commercial_register = "commercial_register"
 
 
-def default_expires_at(days: int) -> datetime.datetime:
-    """Expiry timestamp `days` from now, timezone-aware."""
-    return datetime.datetime.now(datetime.UTC) + datetime.timedelta(days=days)
+def default_expires_at(hours: int) -> datetime.datetime:
+    """Expiry timestamp `hours` from now, timezone-aware."""
+    return datetime.datetime.now(datetime.UTC) + datetime.timedelta(hours=hours)
 
 
 class DocgenSession(Base):

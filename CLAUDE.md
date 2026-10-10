@@ -71,7 +71,7 @@ These are the load-bearing design rules; violating them is how you introduce a h
 - **Templates live in `src/legal_assistant/docgen/templates/files/`**, not at
   the repo root, for the same packaging reason. `registry.verify_all()` runs at
   app startup so a template edit that drops a placeholder fails the deploy.
-- **docgen uploads are purged after 2 days** by `docgen/purge_loop.py`, inside
+- **docgen uploads are purged after 4 hours** (`DOCGEN_RETENTION_HOURS`) by `docgen/purge_loop.py`, inside
   the web process: the files live on the web service's Railway volume, which
   no separate cron service can mount. They carry national ID and passport
   numbers.

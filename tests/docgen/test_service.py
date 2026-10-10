@@ -687,7 +687,7 @@ class _FakeAddDb:
 def test_create_session_refuses_masahma_while_it_is_switched_off(monkeypatch):
     class _FakeSettings:
         docgen_masahma_enabled = False
-        docgen_retention_days = 2
+        docgen_retention_hours = 4
 
     monkeypatch.setattr(service, "get_settings", lambda: _FakeSettings())
     with pytest.raises(SessionStateError):
@@ -697,7 +697,7 @@ def test_create_session_refuses_masahma_while_it_is_switched_off(monkeypatch):
 def test_create_session_allows_masahma_once_switched_on(monkeypatch):
     class _FakeSettings:
         docgen_masahma_enabled = True
-        docgen_retention_days = 2
+        docgen_retention_hours = 4
 
     monkeypatch.setattr(service, "get_settings", lambda: _FakeSettings())
     session = asyncio.run(service.create_session(_FakeAddDb(), 7, "masahma", "aoa_only"))
